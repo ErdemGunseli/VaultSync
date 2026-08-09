@@ -1,0 +1,7 @@
+# Real secret files are never committed - only the annotated examples are.
+vault-*.env
+!**/secrets.example/vault-*.env
+
+# Local run artefacts
+/data/
+*.log

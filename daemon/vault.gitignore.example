@@ -1,0 +1,40 @@
+# =============================================================================
+# Recommended .gitignore for the VAULT CONTENT repo (not for this repo).
+# =============================================================================
+# Copy this to the root of the vault repo as `.gitignore`. Without it, the
+# bridge's `git add -A` bakes per-device UI churn and Obsidian Sync's own
+# conflict copies permanently into vault history.
+#
+# Deliberately NOT ignoring `.obsidian/` wholesale: the plugin/theme declaration
+# there is real, low-churn configuration worth versioning, and agents are meant
+# to be able to change it.
+# =============================================================================
+
+# Per-device UI state - rewrites on nearly every interaction, carries no content.
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/workspace.json.bak
+
+# Obsidian's soft-delete holding pen, not vault content.
+.trash/
+
+# Plugin caches and local indices - regenerate on open, large and binary-ish.
+.obsidian/cache/
+.obsidian/plugins/**/cache/
+.obsidian/plugins/**/*.cache
+.obsidian/plugins/*/data.json.bak
+
+# Obsidian Sync's own conflict copies. These are transport-layer output, not
+# authored content: committing them makes Sync litter permanent in git history
+# where Sync would have let you resolve and discard it. The bridge logs them
+# loudly instead, so they are surfaced without being immortalised.
+*.sync-conflict-*.md
+*[Cc]onflicted copy*.md
+
+# obsidian-headless state must live outside the vault tree (it holds the auth
+# token). This is a guard against it ever landing here by mistake.
+.obsidian-headless/
+
+# OS cruft that ends up inside vault directories.
+.DS_Store
+Thumbs.db

@@ -1,0 +1,42 @@
+# =============================================================================
+# Render blueprint - vault-bridge as a background worker.
+# =============================================================================
+# A background worker (not a web service): the bridge has no inbound HTTP
+# surface at all, so there is no port to bind and no health path to serve.
+#
+# Deliberately NOT tied to this Render account. Everything account-specific
+# (which owner, which region, the secrets) is set at provision time, so moving
+# to another account is: create from this blueprint there, re-add the secret
+# file, deploy. No code change.
+# =============================================================================
+services:
+  - type: worker
+    name: vault-bridge
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # workers have no free tier; starter is the floor
+    region: frankfurt
+    autoDeploy: true
+    disk:
+      name: vault-data
+      mountPath: /data     # vault clones + Obsidian sync state (state.db)
+      sizeGB: 5
+    envVars:
+      # Auth: PREFERRED path. `ob` reads this env var directly, so there is no
+      # login call at runtime and MFA on the account is irrelevant.
+      - key: OBSIDIAN_AUTH_TOKEN
+        sync: false
+      # Single-vault plain-env mode. For multiple vaults, drop these and mount
+      # one Secret File per vault instead (see README).
+      - key: VAULT_NAME
+        value: planning
+      - key: VAULT_REPO                     # https://<token>@github.com/<owner>/<vault>.git
+        sync: false
+      - key: VAULT_SYNC_REMOTE              # remote vault name/id from `ob sync-list-remote`
+        sync: false
+      - key: VAULT_SYNC_ENCRYPTION_PASSWORD # required if the remote vault is E2E encrypted
+        sync: false
+      - key: VAULT_BRANCH
+        value: main
+      - key: VAULT_BRIDGE_INTERVAL
+        value: "15"
