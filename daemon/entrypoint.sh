@@ -39,9 +39,20 @@ trap 'log "shutting down"; for p in $PIDS; do kill "$p" 2>/dev/null || true; don
 
 # supervise <name> <secret-file-or-empty>
 # Restart-with-backoff so one vault's failure never takes the others down.
+#
+# SIGNAL FORWARDING IS LOAD-BEARING. The retry-loop subshell backgrounds its
+# bridge child and forwards INT/TERM to it explicitly. Without that, killing
+# the subshell leaves the bridge orphaned on PID 1, still committing and
+# pushing - so a redeploy would run TWO daemons against one vault repo. This
+# was observed, not theorised: an orphaned bridge kept pushing edits after its
+# supervisor logged "shutting down". (Dockerfile's `tini -g` signals the whole
+# process group as a second line of defence; this forwarding must hold even
+# without tini, e.g. under a bare `docker run --init=false` or in tests.)
 supervise() {
-  local name="$1" secret="$2" delay=5
+  local name="$1" secret="$2"
   (
+    delay=5; child=""
+    trap '[ -n "$child" ] && kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' INT TERM
     while true; do
       (
         if [ -n "$secret" ]; then
@@ -57,9 +68,13 @@ supervise() {
         export VAULT_NAME="$name"
         export VAULT_DIR="${VAULT_DIR:-$DATA_DIR/vaults/$name}"
         exec "$BRIDGE_BIN"
-      )
+      ) &
+      child=$!
+      wait "$child"   # interruptible: the trap above fires mid-wait
       log "vault '$name' exited - restarting in ${delay}s"
-      sleep "$delay"
+      sleep "$delay" &
+      child=$!        # forward a shutdown arriving mid-backoff too
+      wait "$child"
       delay=$(( delay < 120 ? delay * 2 : 120 ))
     done
   ) &

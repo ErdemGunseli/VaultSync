@@ -23,12 +23,11 @@
 .obsidian/plugins/**/*.cache
 .obsidian/plugins/*/data.json.bak
 
-# Obsidian Sync's own conflict copies. These are transport-layer output, not
-# authored content: committing them makes Sync litter permanent in git history
-# where Sync would have let you resolve and discard it. The bridge logs them
-# loudly instead, so they are surfaced without being immortalised.
-*.sync-conflict-*.md
-*[Cc]onflicted copy*.md
+# NOTE: conflicted-copy notes are deliberately NOT ignored. They are the
+# surfacing mechanism: a genuine same-region collision is committed as
+# "Note (conflicted copy <timestamp>).md" so it appears on every device,
+# inside Obsidian, where Sync's own conflicts appear. Ignoring them would
+# hide conflicts in a server log nobody reads.
 
 # obsidian-headless state must live outside the vault tree (it holds the auth
 # token). This is a guard against it ever landing here by mistake.

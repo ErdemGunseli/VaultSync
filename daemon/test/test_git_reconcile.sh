@@ -77,22 +77,46 @@ await 25 test -f "$TMP/vault/from-agent.md"
 check "a commit pushed to the remote lands in the vault working tree" "0" "$?"
 check "its content is intact" "written by an agent" "$(cat "$TMP/vault/from-agent.md" 2>/dev/null)"
 
-# --- Never force-push, never rewrite: divergence is surfaced, not resolved --
-before="$(git -C "$TMP/remote.git" rev-parse main)"
-git -C "$TMP/vault" commit -q --allow-empty -m "local only" 2>/dev/null
-git -C "$TMP/agent" pull -q --ff-only origin main
-echo "conflicting" > "$TMP/agent/from-agent.md"
-git -C "$TMP/agent" commit -qam "remote diverges" && git -C "$TMP/agent" push -q origin main
-after_remote="$(git -C "$TMP/remote.git" rev-parse main)"
-sleep 4
-still="$(git -C "$TMP/remote.git" rev-parse main)"
-check "remote advanced by the agent, not rewritten by the bridge" "$after_remote" "$still"
-# Surfaced on every pass while the divergence stands - that is the intent, so
-# assert "at least once", not an exact count tied to the poll interval.
-nff="$(grep -c 'not fast-forward' "$TMP/log")"
-check "bridge keeps surfacing the non-fast-forward instead of forcing" "yes" \
-  "$([ "$nff" -ge 1 ] && echo yes || echo no)"
+# --- Divergence: resolved by MERGE (Sync semantics), never by force ---------
+# Different files diverge: local commit + remote commit -> clean auto-merge,
+# both sides present afterwards, remote history additive (agent commit still
+# an ancestor - the no-force proof).
+git -C "$TMP/agent" pull -q origin main
+echo "device side" > "$TMP/vault/device-note.md"
+echo "agent side" > "$TMP/agent/agent-note.md"
+git -C "$TMP/agent" add -A && git -C "$TMP/agent" commit -qm "agent diverges"
+agent_rev="$(git -C "$TMP/agent" rev-parse HEAD)"
+git -C "$TMP/agent" push -q origin main
+
+merged() {
+  git -C "$TMP/remote.git" show main:device-note.md >/dev/null 2>&1 \
+    && git -C "$TMP/remote.git" show main:agent-note.md >/dev/null 2>&1
+}
+await 25 merged
+check "diverged edits in different files auto-merge; both reach the remote" "0" "$?"
+git -C "$TMP/remote.git" merge-base --is-ancestor "$agent_rev" main
+check "agent's commit is an ancestor of the merged remote (nothing rewritten)" "0" "$?"
 check "bridge never ran a force push" "0" "$(grep -c 'force' "$TMP/log")"
+
+# Same-file same-region collision -> Obsidian-style conflicted copy, committed.
+await 15 sh -c "! git -C '$TMP/vault' status --porcelain | grep -q ."
+echo "device wins" > "$TMP/vault/clash.md"
+git -C "$TMP/agent" pull -q origin main
+echo "agent wins" > "$TMP/agent/clash.md"
+git -C "$TMP/agent" add -A && git -C "$TMP/agent" commit -qm "agent clash" && git -C "$TMP/agent" push -q origin main
+
+copy_on_remote() {
+  git -C "$TMP/remote.git" ls-tree --name-only main | grep -q "clash (conflicted copy"
+}
+await 25 copy_on_remote
+check "collision produces a committed conflicted-copy note" "0" "$?"
+check "main note keeps the device side" "device wins" \
+  "$(git -C "$TMP/remote.git" show main:clash.md 2>/dev/null)"
+copyname="$(git -C "$TMP/remote.git" ls-tree --name-only main | grep "clash (conflicted copy" | head -1)"
+check "conflicted copy carries the agent side" "agent wins" \
+  "$(git -C "$TMP/remote.git" show "main:$copyname" 2>/dev/null)"
+check "collision was logged as CONFLICT" "yes" \
+  "$([ "$(grep -c 'CONFLICT' "$TMP/log")" -ge 1 ] && echo yes || echo no)"
 
 # Degradation path is announced, not silent.
 check "git-only degradation is warned about" "1" "$(grep -c 'git-only mode' "$TMP/log")"

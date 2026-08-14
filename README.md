@@ -77,10 +77,15 @@ These are not aspirations. They are enforced in code and covered by tests.
 **git is the source of truth.** Sync is a device transport, not the record. Every
 disagreement resolves toward git.
 
-**Surface conflicts. Never rewrite them.** Pulls are `--ff-only`. Pushes are *never* forced.
-Sync is configured with `--conflict-strategy conflict` so it writes conflict files instead of
-silently merging, and the daemon logs every one it sees. A divergence is a thing a human
-decides, and the daemon's job is to make sure you find out.
+**Conflicts resolve the way Obsidian Sync resolves them — never worse, never silently
+destructive.** Sync's own default auto-merges concurrent edits, and so does the bridge:
+divergence between git and the vault is resolved by a real merge, and edits to different
+parts of a note flow together exactly as they would under plain Sync. A genuine same-region
+collision becomes an Obsidian-style **"Note (conflicted copy …).md" committed into the
+vault** — it appears on your devices, inside Obsidian, precisely where Sync's own conflicts
+appear, with your device's version kept in the main note. Pushes are *never* forced, and git
+history keeps every side of every conflict, so nothing is ever lost — the safety net is
+strictly stronger than Sync's version history.
 
 **Fail soft, and say so.** No credentials means idle, not crash. No Obsidian auth means
 git-only mode *with a warning* — agents keep syncing, phone-only edits do not, and the log
@@ -92,6 +97,18 @@ credential fails in a second instead of hanging invisibly forever.
 **Refuse rather than corrupt.** If the vault declares Git LFS filters and `git-lfs` is
 missing, the daemon exits. Committing would write pointer files where your images should be —
 corruption you'd discover months later opening a broken note.
+
+**Fast, but debounced.** A local edit is picked up by `inotify` and reaches the remote in
+roughly 1-2 seconds — not the old fixed 15-second poll. A burst of continuous writes (Obsidian
+saves on every keystroke) is debounced into one commit rather than one per keystroke. Remote
+polling is adaptive: quick while there's been recent activity, backing off toward an idle rate
+otherwise. If `inotify-tools` is ever missing at runtime, the daemon falls back to
+interval-only polling with a WARNING rather than losing local-edit detection silently.
+
+**Never commit past the Sync cap.** Obsidian Sync (Standard plan) refuses files over 5MB. A
+file that size committed via git would reach the repo but never reach a device — silent
+divergence. The daemon refuses to commit an oversize file (unstaging it, not deleting it) and
+warns loudly, every pass, until it's resolved.
 
 ---
 
@@ -174,8 +191,11 @@ bash daemon/test/run.sh
 They are **behavioural**. They run the real entrypoint and the real daemon against real git
 repositories and assert on what actually happened — that edits move in both directions, that
 a divergence is surfaced rather than force-pushed, that git-only degradation is announced,
-that a stray global variable can't collapse every vault onto one repo. Nothing greps the
-source, so a rename cannot fake a pass and inverted logic cannot slip through.
+that a stray global variable can't collapse every vault onto one repo, that a local edit
+reaches the remote in seconds via `inotify` (falling back cleanly when it's absent), that a
+burst of continuous writes debounces into one commit, and that a file over the Sync cap is
+withheld and warned about while its siblings still sync. Nothing greps the source, so a rename
+cannot fake a pass and inverted logic cannot slip through.
 
 ---
 
@@ -183,7 +203,7 @@ source, so a rename cannot fake a pass and inverted logic cannot slip through.
 
 | Component | State |
 |---|---|
-| **Sync daemon** | Built, tested (19/19), validated against `obsidian-headless` 0.0.14 |
+| **Sync daemon** | Built, tested (38/38), validated against `obsidian-headless` 0.0.14 |
 | **Agent access skill** | Designed, specified in [`docs/`](docs/), not yet built |
 | **Live deployment** | Not yet — needs a vault repo and credentials |
 

@@ -41,10 +41,11 @@ cap, and route them through LFS (see `.gitattributes`) rather than committing th
 is not a style preference - a file over the cap desyncs the vault until someone manually
 intervenes.
 
-## Conflicts are surfaced, never auto-resolved
+## Conflicts resolve like Obsidian Sync, and conflicted copies are for the human
 
-If a sync conflict produces a `*.sync-conflict-*.md` or `*conflicted copy*.md` file, it is
-left in place for a human to resolve - see `.gitignore`, which keeps these out of git history
-on purpose (they are transport-layer output, not authored content) while still surfacing
-them in the working tree. No agent auto-merges, auto-deletes, or auto-picks-a-winner between
-conflicting copies. Flag it and stop.
+The sync system auto-merges what Sync itself would auto-merge; a genuine same-region
+collision arrives as a committed `Note (conflicted copy <timestamp>).md` beside the main
+note, visible on every device. Those copies are the owner's to reconcile: no agent merges,
+deletes, or picks a winner between a note and its conflicted copy. If your work is blocked
+by one, flag it and stop. Git history holds every side of every conflict, so nothing you do
+can be the only copy of anything - but resolution is still a human decision.
