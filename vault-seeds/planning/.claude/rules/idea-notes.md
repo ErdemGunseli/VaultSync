@@ -1,0 +1,49 @@
+---
+alwaysApply: false
+paths: ideas/**/*.md,inbox/**/*.md
+---
+
+# Idea notes
+
+## Floor schema
+
+Every idea note has frontmatter; only `title` and `state` are required.
+
+```yaml
+---
+title: One-line title          # required
+state: not-started             # required: not-started | started | done
+horizon: inbox                 # optional: inbox | now | next | later | someday
+area: software                 # optional: software | business | personal | content
+projects: []                   # optional, multi-valued (soft overlap)
+domains: []                    # optional, multi-valued (can span projects)
+depends_on: []                 # optional hard constraint (guardrail, not a ranking)
+created: 2026-08-14
+---
+```
+
+**No numeric priority field, ever.** "What's next" is computed by a `/next`-style workflow
+from live context, not stored on the note. Do not add a `priority` field, a rank, or a
+sort-order number to any idea note under any name.
+
+## One idea per note
+
+A capture in `inbox/` or an entry in `ideas/` holds exactly one idea. Do not fold several
+ideas into one note "because they're related" - link them instead once they have their own
+notes.
+
+## Overlap is tags, never folders
+
+An idea that spans more than one project or theme gets multiple `projects`/`domains` values
+and `[[wikilinks]]` to related notes. It does not get filed into a folder named after the
+combination, and it does not get duplicated into two folders. Folders in this vault
+(`inbox/`, `ideas/`, `archive/`) are coarse lifecycle buckets, not a taxonomy.
+
+## Body scales with importance
+
+Write as little or as much as the idea earns. A one-line note is a complete, valid idea. A
+complex idea can run to pages with checklists and Mermaid diagrams. Do not pad a small idea
+to look thorough, and do not compress a large one to fit a template.
+
+- Add a `- [ ]` checklist only when there are concrete next steps to check off.
+- Link related ideas with `[[wikilinks]]`; let structure emerge from links, not folders.
