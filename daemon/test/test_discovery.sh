@@ -15,7 +15,7 @@ PASS=0; FAIL=0
 make_stub() {
   cat > "$1" <<'STUB'
 #!/usr/bin/env bash
-echo "LAUNCHED name=${VAULT_NAME:-} repo=${VAULT_REPO:-} dir=${VAULT_DIR:-} token=${OBSIDIAN_AUTH_TOKEN:-}"
+echo "LAUNCHED name=${VAULT_NAME:-} repo=${VAULT_REPO:-} dir=${VAULT_DIR:-} token=${OBSIDIAN_AUTH_TOKEN:-} encpw=${VAULT_SYNC_ENCRYPTION_PASSWORD:-}"
 exit 0
 STUB
   chmod +x "$1"
@@ -97,6 +97,32 @@ OUT="$(run_entry "$S" VAULT_REPO=https://example.invalid/GLOBAL.git VAULT_DIR=/d
 check "global VAULT_REPO does not override a vault's own" "0" "$(echo "$OUT" | grep -c 'GLOBAL.git')"
 check "global VAULT_DIR does not collapse vaults into one dir" "0" "$(echo "$OUT" | grep -c 'dir=/data/GLOBAL')"
 check "both vaults still use their own repo" "2" "$(echo "$OUT" | grep -c 'repo=https://example.invalid/\(own\|two\).git')"
+rm -rf "$S"
+
+# --- 7. Env-group mode: VAULTS list + namespaced vars, fully env-driven ------
+S="$(mktemp -d)"
+OUT="$(run_entry "$S" VAULTS="alpha,beta" \
+  VAULT_ALPHA_REPO=https://example.invalid/a.git \
+  VAULT_BETA_REPO=https://example.invalid/b.git \
+  VAULT_BETA_SYNC_ENCRYPTION_PASSWORD=beta-only-secret)"
+names="$(echo "$OUT" | grep -o 'LAUNCHED name=[a-z]*' | sed 's/LAUNCHED name=//' | sort | tr '\n' ',')"
+check "VAULTS list launches one bridge per name" "alpha,beta," "$names"
+repo_a="$(echo "$OUT" | grep 'name=alpha' | grep -o 'repo=[^ ]*' | sed 's/repo=//')"
+check "namespaced VAULT_<NAME>_REPO maps to the right vault" "https://example.invalid/a.git" "$repo_a"
+check "a per-vault encryption password does not bleed to a sibling" "0" \
+  "$(echo "$OUT" | grep 'name=alpha' | grep -c 'beta-only-secret')"
+check "the owning vault does receive its password" "1" \
+  "$(echo "$OUT" | grep 'name=beta' | grep -c 'encpw=beta-only-secret')"
+rm -rf "$S"
+
+# --- 8. VAULTS mode wins over secret files (one source of truth at a time) ---
+S="$(mktemp -d)"
+printf 'VAULT_REPO=https://example.invalid/file.git\n' > "$S/vault-filemode.env"
+OUT="$(run_entry "$S" VAULTS="envmode" VAULT_ENVMODE_REPO=https://example.invalid/env.git)"
+check "VAULTS mode takes precedence over secret files" "1" \
+  "$(echo "$OUT" | grep -c 'LAUNCHED name=envmode')"
+check "secret-file vault is not also launched" "0" \
+  "$(echo "$OUT" | grep -c 'LAUNCHED name=filemode')"
 rm -rf "$S"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

@@ -4,13 +4,23 @@
 # =============================================================================
 # There is NO manifest. A vault is enabled by the existence of its config:
 #
-#   1. Secret-file mode (multi-vault): every $SECRETS_DIR/vault-<name>.env is a
-#      vault. `vault-planning.env` => vault "planning". Adding a vault is adding
-#      a file; removing one is removing a file. Nothing else to keep in sync.
+#   1. Env-group mode (multi-vault, fully env-driven): VAULTS is a comma list of
+#      vault names ("planning,personal"); each vault's keys are namespaced env
+#      vars VAULT_<NAME>_REPO / _BRANCH / _SYNC_REMOTE /
+#      _SYNC_ENCRYPTION_PASSWORD / _SYNC_CONFIGS / _DEVICE_NAME / _MAX_FILE_MB
+#      (name uppercased, "-" becomes "_"). One Render env group can therefore
+#      define the entire service with zero secret files. Takes precedence over
+#      secret files when set.
 #
-#   2. Plain-env mode (single vault): no secret files, but VAULT_REPO set in the
-#      environment => one vault named $VAULT_NAME (default "planning"). This is
-#      the simple path on a host where plain env vars are easier than files.
+#   2. Secret-file mode (multi-vault): every $SECRETS_DIR/vault-<name>.env is a
+#      vault. `vault-planning.env` => vault "planning". Adding a vault is adding
+#      a file; removing one is removing a file.
+#
+#   3. Plain-env mode (single vault): neither of the above, but VAULT_REPO set
+#      => one vault named $VAULT_NAME (default "planning").
+#
+# Shared, non-per-vault keys stay plain in every mode: OBSIDIAN_AUTH_TOKEN and
+# GIT_TOKEN apply to all vaults (one Obsidian account, one PAT).
 #
 # Sync state (auth token + per-vault state.db) lives in ONE shared
 # XDG_CONFIG_HOME on the persistent disk. obsidian-headless already namespaces
@@ -49,21 +59,35 @@ trap 'log "shutting down"; for p in $PIDS; do kill "$p" 2>/dev/null || true; don
 # process group as a second line of defence; this forwarding must hold even
 # without tini, e.g. under a bare `docker run --init=false` or in tests.)
 supervise() {
-  local name="$1" secret="$2"
+  local name="$1" secret="$2" mode="${3:-file}"
   (
     delay=5; child=""
     trap '[ -n "$child" ] && kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' INT TERM
     while true; do
       (
-        if [ -n "$secret" ]; then
-          # Per-vault keys must come from THIS vault's file only. Inheriting them
-          # from the container environment would silently point every vault at
-          # one repo/dir and corrupt their sync state into each other.
-          unset VAULT_DIR VAULT_REPO VAULT_SYNC_REMOTE VAULT_SYNC_ENCRYPTION_PASSWORD
+        if [ "$mode" != "plain" ]; then
+          # Per-vault keys must come from THIS vault's config only. Inheriting
+          # them from the container environment would silently point every vault
+          # at one repo/dir and corrupt their sync state into each other.
+          unset VAULT_DIR VAULT_REPO VAULT_BRANCH VAULT_SYNC_REMOTE \
+                VAULT_SYNC_ENCRYPTION_PASSWORD VAULT_SYNC_CONFIGS \
+                VAULT_DEVICE_NAME VAULT_MAX_FILE_MB
+        fi
+        if [ "$mode" = "file" ] && [ -n "$secret" ]; then
           set -a
           # shellcheck disable=SC1090
           [ -r "$secret" ] && . "$secret"
           set +a
+        elif [ "$mode" = "envmap" ]; then
+          # VAULT_<NAME>_<KEY> -> VAULT_<KEY>, name uppercased, "-" -> "_".
+          U="$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+          for k in REPO BRANCH SYNC_REMOTE SYNC_ENCRYPTION_PASSWORD \
+                   SYNC_CONFIGS DEVICE_NAME MAX_FILE_MB; do
+            src="VAULT_${U}_${k}"
+            if [ -n "${!src:-}" ]; then
+              export "VAULT_${k}=${!src}"
+            fi
+          done
         fi
         export VAULT_NAME="$name"
         export VAULT_DIR="${VAULT_DIR:-$DATA_DIR/vaults/$name}"
@@ -83,19 +107,34 @@ supervise() {
 }
 
 found=0
-for f in "$SECRETS_DIR"/vault-*.env; do
-  [ -e "$f" ] || continue
-  base="$(basename "$f")"; name="${base#vault-}"; name="${name%.env}"
-  supervise "$name" "$f"
-  found=$((found + 1))
-done
+if [ -n "${VAULTS:-}" ]; then
+  old_ifs="$IFS"; IFS=','
+  # shellcheck disable=SC2086
+  set -- $VAULTS
+  IFS="$old_ifs"
+  for name in "$@"; do
+    name="${name// /}"
+    [ -n "$name" ] || continue
+    supervise "$name" "" envmap
+    found=$((found + 1))
+  done
+fi
+
+if [ "$found" -eq 0 ]; then
+  for f in "$SECRETS_DIR"/vault-*.env; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"; name="${base#vault-}"; name="${name%.env}"
+    supervise "$name" "$f" file
+    found=$((found + 1))
+  done
+fi
 
 if [ "$found" -eq 0 ]; then
   if [ -n "${VAULT_REPO:-}" ]; then
-    supervise "${VAULT_NAME:-planning}" ""
+    supervise "${VAULT_NAME:-planning}" "" plain
     found=1
   else
-    log "No $SECRETS_DIR/vault-*.env and no VAULT_REPO - nothing to do."
+    log "No VAULTS list, no $SECRETS_DIR/vault-*.env, no VAULT_REPO - nothing to do."
     log "Idling so the service stays healthy; add config and redeploy."
     while true; do sleep 3600; done
   fi
