@@ -141,6 +141,18 @@ if [ -z "$VAULT_REPO" ]; then
   while true; do sleep 3600; done
 fi
 
+# A tokenless https VAULT_REPO + a global GIT_TOKEN compose into an
+# authenticated URL here. This keeps the per-vault secret files free of
+# credentials (they carry only identifiers - repo URL, Sync remote name), so
+# one PAT set once as a service env var covers every vault, and rotating it is
+# one dashboard edit instead of one per vault.
+if [ -n "${GIT_TOKEN:-}" ]; then
+  case "$VAULT_REPO" in
+    https://*@*) ;;  # URL already carries a credential - it wins
+    https://*)   VAULT_REPO="https://${GIT_TOKEN}@${VAULT_REPO#https://}" ;;
+  esac
+fi
+
 command -v git >/dev/null 2>&1 || { log "FATAL: git not installed"; exit 1; }
 HAVE_LFS=0
 if command -v git-lfs >/dev/null 2>&1; then
