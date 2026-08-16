@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Vault rule & skill sync: .cursor/ is the source of truth, .claude/ is generated.
+
+Mirrors the factory's agent:sync convention at vault scale, dependency-free:
+
+  .cursor/rules/<name>.mdc   ->  .claude/rules/<name>.md   (globs: -> paths:)
+  .cursor/skills/<name>/**   ->  .claude/skills/<name>/**  (verbatim copy)
+
+Usage, from the vault root:
+  python3 .agent-tools/sync-rules.py          # regenerate .claude/ from .cursor/
+  python3 .agent-tools/sync-rules.py --check  # exit 1 if .claude/ is stale
+
+Never edit .claude/ by hand; edit .cursor/ and re-run. Generated rule files get
+`paths:` frontmatter (Claude Code's scoping field) derived from `globs:`.
+"""
+from __future__ import annotations
+
+import filecmp
+import re
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CURSOR_RULES = ROOT / ".cursor" / "rules"
+CURSOR_SKILLS = ROOT / ".cursor" / "skills"
+CLAUDE_RULES = ROOT / ".claude" / "rules"
+CLAUDE_SKILLS = ROOT / ".claude" / "skills"
+
+
+def convert_rule(src: Path) -> str:
+    text = src.read_text()
+    m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
+    if not m:
+        return text  # no frontmatter: mirror verbatim
+    front, body = m.groups()
+    globs = ""
+    for line in front.splitlines():
+        if line.startswith("globs:"):
+            globs = line.split(":", 1)[1].strip()
+    header = f"---\npaths: {globs}\n---\n" if globs else "---\n---\n"
+    return header + body
+
+
+def generated() -> dict[Path, str | Path]:
+    """Map of every .claude path to its expected content (str) or source (Path)."""
+    out: dict[Path, str | Path] = {}
+    if CURSOR_RULES.is_dir():
+        for src in sorted(CURSOR_RULES.glob("*.mdc")):
+            out[CLAUDE_RULES / (src.stem + ".md")] = convert_rule(src)
+    if CURSOR_SKILLS.is_dir():
+        for src in sorted(p for p in CURSOR_SKILLS.rglob("*") if p.is_file()):
+            out[CLAUDE_SKILLS / src.relative_to(CURSOR_SKILLS)] = src
+    return out
+
+
+def main() -> int:
+    check = "--check" in sys.argv
+    expect = generated()
+    stale: list[str] = []
+
+    for dst, src in expect.items():
+        want = src.read_text() if isinstance(src, Path) else src
+        have = dst.read_text() if dst.is_file() else None
+        if have != want:
+            stale.append(str(dst.relative_to(ROOT)))
+            if not check:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if isinstance(src, Path):
+                    shutil.copy2(src, dst)
+                else:
+                    dst.write_text(want)
+
+    # orphans: generated files whose source vanished
+    for base in (CLAUDE_RULES, CLAUDE_SKILLS):
+        if not base.is_dir():
+            continue
+        for f in sorted(p for p in base.rglob("*") if p.is_file()):
+            if f not in expect:
+                stale.append(f"{f.relative_to(ROOT)} (orphan)")
+                if not check:
+                    f.unlink()
+
+    if check:
+        if stale:
+            print("STALE - run: python3 .agent-tools/sync-rules.py")
+            for s in stale:
+                print(f"  {s}")
+            return 1
+        print("in sync")
+        return 0
+
+    print(f"synced ({len(stale)} file(s) written/removed)" if stale else "already in sync")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

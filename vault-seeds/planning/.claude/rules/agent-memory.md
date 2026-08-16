@@ -1,5 +1,4 @@
 ---
-alwaysApply: false
 paths: ideas/**,inbox/**,archive/**,Dashboard/**,_templates/**,.agent-memory/**
 ---
 

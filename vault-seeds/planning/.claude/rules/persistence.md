@@ -1,5 +1,4 @@
 ---
-alwaysApply: false
 paths: ideas/**/*.md,inbox/**/*.md,archive/**/*.md,Dashboard/**/*.md,_templates/**/*.md
 ---
 

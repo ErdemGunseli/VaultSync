@@ -1,15 +1,16 @@
 ---
-alwaysApply: false
 paths: ideas/**/*.md,inbox/**/*.md,archive/**/*.md,Dashboard/**/*.md,_templates/**/*.md
 ---
 
 <!--
-paths is vault-relative and deliberately directory-prefixed: a bare **/*.md is
-invalid YAML (leading * scans as an alias) and would also match ANY markdown in a
-cross-root session, which is unverified territory - see docs/isolation.md in the
-VaultSync repo. Directory-prefixed globs are the same convention the QUANTSOC rule
-corpus uses. This vault should still be opened as its own session root, never
-registered alongside a product repo.
+globs above is vault-relative (this file lives at the vault root's .cursor/rules/,
+so "**/*.md" resolves within this repo when the vault is opened as its own session
+root - see docs/isolation.md in the VaultSync repo for why it must be opened alone,
+never registered alongside a product repo). Verify this scoping actually holds
+before trusting it: confirm with a real session that a rule this close to the vault
+root does not leak into a different repo registered at the same time. If it does,
+narrow the glob further (e.g. ideas/**/*.md,inbox/**/*.md,archive/**/*.md) rather
+than assume "**/*.md" is safe by construction.
 -->
 
 # Vault constitution

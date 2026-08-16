@@ -1,5 +1,4 @@
 ---
-alwaysApply: false
 paths: Notes/**,.agent-memory/**
 ---
 
@@ -18,9 +17,14 @@ codified, rather than re-deriving it every session.
   frontmatter schema, `type:`, section headings in order, image/link conventions, and
   tone. Match the existing area's dominant pattern before inventing one; a new format is
   a deliberate act, recorded in the rule, never an accident of one session's taste.
-- **Skills** - a workflow worth invoking by name becomes a skill in `.claude/skills/` +
-  `.cursor/skills/` (both mirrors, identical), written to the same standard as the
-  factory's: frontmatter with name + trigger description, concise imperative body.
+- **Skills** - a workflow worth invoking by name becomes a skill in `.cursor/skills/`,
+  written to the same standard as the factory's: frontmatter with name + trigger
+  description, concise imperative body.
+
+**`.cursor/` is the source of truth; `.claude/` is generated.** After creating or editing
+any rule or skill, run `python3 .agent-tools/sync-rules.py` from the vault root and commit
+both surfaces together. Never edit `.claude/` by hand - `--check` mode exists to catch
+drift, and a stale mirror silently splits behaviour between providers.
 - **Area memory files** under `.agent-memory/` per the agent-memory rule.
 
 Announce every created or materially changed rule/skill/standard in the chat response of

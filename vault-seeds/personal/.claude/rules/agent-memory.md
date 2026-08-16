@@ -1,5 +1,4 @@
 ---
-alwaysApply: false
 paths: Notes/**,.agent-memory/**
 ---
 
