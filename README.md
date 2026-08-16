@@ -119,11 +119,21 @@ because its config does.**
 
 **One vault** — set `VAULT_REPO` as a plain environment variable. Done.
 
-**Several vaults** — either name them in one env group (`VAULTS=planning,personal` plus
-`VAULT_<NAME>_REPO` / `_SYNC_REMOTE` / `_SYNC_ENCRYPTION_PASSWORD` per vault — one Render
-env group defines the whole service), or drop one file per vault at
-`$SECRETS_DIR/vault-<name>.env`. Either way, adding a vault is adding config; removing one
-is removing it.
+**Several vaults** — indexed identifier variables, where **the repo URL is the identity**
+(git is the source of truth, so the repo link names the vault):
+
+```
+VAULT_1=https://github.com/you/PlanningVault.git
+VAULT_1_SYNC_REMOTE=Planning
+VAULT_1_SYNC_ENCRYPTION_PASSWORD=...
+VAULT_2=https://github.com/you/PersonalVault.git
+...
+```
+
+The local name derives from the repo basename (`PlanningVault` → `planningvault`;
+`VAULT_n_NAME` overrides). Indices tolerate gaps — deleting `VAULT_2` never renumbers
+`VAULT_3`. One Render env group defines the whole service. (Secret-file mode —
+one `vault-<name>.env` per vault — still exists for hosts where files beat env vars.)
 
 ### Adding a vault is three things, not one
 

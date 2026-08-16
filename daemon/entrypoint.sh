@@ -4,13 +4,16 @@
 # =============================================================================
 # There is NO manifest. A vault is enabled by the existence of its config:
 #
-#   1. Env-group mode (multi-vault, fully env-driven): VAULTS is a comma list of
-#      vault names ("planning,personal"); each vault's keys are namespaced env
-#      vars VAULT_<NAME>_REPO / _BRANCH / _SYNC_REMOTE /
-#      _SYNC_ENCRYPTION_PASSWORD / _SYNC_CONFIGS / _DEVICE_NAME / _MAX_FILE_MB
-#      (name uppercased, "-" becomes "_"). One Render env group can therefore
-#      define the entire service with zero secret files. Takes precedence over
-#      secret files when set.
+#   1. Env-group mode (multi-vault, fully env-driven): VAULT_1, VAULT_2, ... are
+#      the identifier variables, each holding the vault's git repo URL - the
+#      repo IS the vault's identity (git is the source of truth). Per-vault
+#      settings are VAULT_<n>_BRANCH / _SYNC_REMOTE / _SYNC_ENCRYPTION_PASSWORD
+#      / _SYNC_CONFIGS / _DEVICE_NAME / _MAX_FILE_MB / _NAME. The local name
+#      (working dir, log prefix, sync-state key) derives from the repo basename
+#      lowercased ("PlanningVault.git" -> "planningvault"); _NAME overrides.
+#      Indices may have gaps - deleting VAULT_2 never requires renumbering
+#      VAULT_3. One Render env group defines the whole service with zero secret
+#      files. Takes precedence over secret files when any VAULT_<n> is set.
 #
 #   2. Secret-file mode (multi-vault): every $SECRETS_DIR/vault-<name>.env is a
 #      vault. `vault-planning.env` => vault "planning". Adding a vault is adding
@@ -78,12 +81,15 @@ supervise() {
           # shellcheck disable=SC1090
           [ -r "$secret" ] && . "$secret"
           set +a
-        elif [ "$mode" = "envmap" ]; then
-          # VAULT_<NAME>_<KEY> -> VAULT_<KEY>, name uppercased, "-" -> "_".
-          U="$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
-          for k in REPO BRANCH SYNC_REMOTE SYNC_ENCRYPTION_PASSWORD \
+        elif [ "$mode" = "indexed" ]; then
+          # secret carries the index. VAULT_<n> is the repo; VAULT_<n>_<KEY>
+          # maps to VAULT_<KEY>.
+          idx="$secret"
+          src="VAULT_${idx}"
+          export "VAULT_REPO=${!src}"
+          for k in BRANCH SYNC_REMOTE SYNC_ENCRYPTION_PASSWORD \
                    SYNC_CONFIGS DEVICE_NAME MAX_FILE_MB; do
-            src="VAULT_${U}_${k}"
+            src="VAULT_${idx}_${k}"
             if [ -n "${!src:-}" ]; then
               export "VAULT_${k}=${!src}"
             fi
@@ -106,33 +112,46 @@ supervise() {
   log "supervising vault '$name'${secret:+ (from $(basename "$secret"))}"
 }
 
+# Derive the vault's local name from its repo URL: basename, minus .git,
+# lowercased, non [a-z0-9_-] squeezed to '-'. The repo is the identity; the
+# name is only a local label (working dir, log prefix, sync-state key).
+derive_name() {
+  local base="${1%%\?*}"
+  base="${base%/}"; base="${base##*/}"; base="${base%.git}"
+  printf '%s' "$base" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-' | sed 's/-*$//;s/^-*//'
+}
+
 found=0
-if [ -n "${VAULTS:-}" ]; then
-  old_ifs="$IFS"; IFS=','
-  # shellcheck disable=SC2086
-  set -- $VAULTS
-  IFS="$old_ifs"
-  for name in "$@"; do
-    name="${name// /}"
-    [ -n "$name" ] || continue
-    # Catch a HALF-ADDED vault at boot, loudly: a name in VAULTS whose repo key
-    # is missing is a config mistake, not an intentional idle. The commonest
-    # cause is forgetting that adding a vault has THREE parts: the env keys,
-    # extending GIT_TOKEN to the new repo (fine-grained PATs enumerate
-    # repositories explicitly - a new repo is NEVER covered automatically),
-    # and the new vault's E2E password if its Sync remote is encrypted.
-    U="$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
-    rv="VAULT_${U}_REPO"
-    if [ -z "${!rv:-}" ]; then
-      log "WARNING: vault '$name' is HALF-ADDED - listed in VAULTS but $rv is unset."
-      log "         Set $rv, extend GIT_TOKEN to cover the new repo, and set"
-      log "         VAULT_${U}_SYNC_ENCRYPTION_PASSWORD if its Sync remote is encrypted."
-      log "         Its bridge will idle until then."
-    fi
-    supervise "$name" "" envmap
-    found=$((found + 1))
-  done
-fi
+# Indexed env-group mode: scan a bounded index space, tolerating gaps so that
+# deleting VAULT_2 never forces renumbering VAULT_3.
+for idx in $(seq 1 64); do
+  rv="VAULT_${idx}"
+  [ -n "${!rv:-}" ] || continue
+  nv="VAULT_${idx}_NAME"
+  name="${!nv:-$(derive_name "${!rv}")}"
+  if [ -z "$name" ]; then
+    log "WARNING: VAULT_${idx} is set but no vault name could be derived - skipping."
+    continue
+  fi
+  supervise "$name" "$idx" indexed
+  found=$((found + 1))
+done
+
+# Catch HALF-ADDED vaults loudly: VAULT_<n>_<sub> keys whose VAULT_<n>
+# identifier is missing are a config mistake, not an intentional idle. The
+# commonest cause is forgetting that adding a vault has THREE parts: the env
+# keys, extending GIT_TOKEN to the new repo (fine-grained PATs enumerate
+# repositories explicitly - a new repo is NEVER covered automatically), and
+# the vault's E2E password if its Sync remote is encrypted.
+for orphan in $(env | grep -o '^VAULT_[0-9]*_' | sed 's/^VAULT_//;s/_$//' | sort -u); do
+  rv="VAULT_${orphan}"
+  if [ -z "${!rv:-}" ]; then
+    log "WARNING: vault #${orphan} is HALF-ADDED - VAULT_${orphan}_* keys exist but"
+    log "         VAULT_${orphan} (the repo URL, the vault's identity) is unset."
+    log "         Set it, extend GIT_TOKEN to cover the repo, and set"
+    log "         VAULT_${orphan}_SYNC_ENCRYPTION_PASSWORD if the Sync remote is encrypted."
+  fi
+done
 
 if [ "$found" -eq 0 ]; then
   for f in "$SECRETS_DIR"/vault-*.env; do

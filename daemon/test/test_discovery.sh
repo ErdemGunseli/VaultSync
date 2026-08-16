@@ -99,40 +99,46 @@ check "global VAULT_DIR does not collapse vaults into one dir" "0" "$(echo "$OUT
 check "both vaults still use their own repo" "2" "$(echo "$OUT" | grep -c 'repo=https://example.invalid/\(own\|two\).git')"
 rm -rf "$S"
 
-# --- 7. Env-group mode: VAULTS list + namespaced vars, fully env-driven ------
+# --- 7. Indexed env-group mode: VAULT_n identifiers, name derived from repo --
 S="$(mktemp -d)"
-OUT="$(run_entry "$S" VAULTS="alpha,beta" \
-  VAULT_ALPHA_REPO=https://example.invalid/a.git \
-  VAULT_BETA_REPO=https://example.invalid/b.git \
-  VAULT_BETA_SYNC_ENCRYPTION_PASSWORD=beta-only-secret)"
+OUT="$(run_entry "$S" \
+  VAULT_1=https://example.invalid/PlanningVault.git \
+  VAULT_2=https://example.invalid/PersonalVault.git \
+  VAULT_2_SYNC_ENCRYPTION_PASSWORD=two-only-secret)"
 names="$(echo "$OUT" | grep -o 'LAUNCHED name=[a-z]*' | sed 's/LAUNCHED name=//' | sort | tr '\n' ',')"
-check "VAULTS list launches one bridge per name" "alpha,beta," "$names"
-repo_a="$(echo "$OUT" | grep 'name=alpha' | grep -o 'repo=[^ ]*' | sed 's/repo=//')"
-check "namespaced VAULT_<NAME>_REPO maps to the right vault" "https://example.invalid/a.git" "$repo_a"
-check "a per-vault encryption password does not bleed to a sibling" "0" \
-  "$(echo "$OUT" | grep 'name=alpha' | grep -c 'beta-only-secret')"
+check "one bridge per VAULT_n, names derived from repo basenames" "personalvault,planningvault," "$names"
+repo_1="$(echo "$OUT" | grep 'name=planningvault' | grep -o 'repo=[^ ]*' | sed 's/repo=//')"
+check "VAULT_n value becomes that vault's repo" "https://example.invalid/PlanningVault.git" "$repo_1"
+check "a per-vault password does not bleed to a sibling" "0" \
+  "$(echo "$OUT" | grep 'name=planningvault' | grep -c 'two-only-secret')"
 check "the owning vault does receive its password" "1" \
-  "$(echo "$OUT" | grep 'name=beta' | grep -c 'encpw=beta-only-secret')"
+  "$(echo "$OUT" | grep 'name=personalvault' | grep -c 'encpw=two-only-secret')"
 rm -rf "$S"
 
-# --- 8. VAULTS mode wins over secret files (one source of truth at a time) ---
+# --- 8. Index gaps tolerated; explicit _NAME override; precedence over files -
 S="$(mktemp -d)"
 printf 'VAULT_REPO=https://example.invalid/file.git\n' > "$S/vault-filemode.env"
-OUT="$(run_entry "$S" VAULTS="envmode" VAULT_ENVMODE_REPO=https://example.invalid/env.git)"
-check "VAULTS mode takes precedence over secret files" "1" \
-  "$(echo "$OUT" | grep -c 'LAUNCHED name=envmode')"
-check "secret-file vault is not also launched" "0" \
+OUT="$(run_entry "$S" \
+  VAULT_3=https://example.invalid/OnlyThree.git \
+  VAULT_3_NAME=custom)"
+check "an index gap (no VAULT_1/2) still finds VAULT_3" "1" \
+  "$(echo "$OUT" | grep -c 'LAUNCHED name=custom')"
+check "VAULT_n_NAME overrides the derived name" "0" \
+  "$(echo "$OUT" | grep -c 'LAUNCHED name=onlythree')"
+check "indexed mode takes precedence over secret files" "0" \
   "$(echo "$OUT" | grep -c 'LAUNCHED name=filemode')"
 rm -rf "$S"
 
-# --- 9. Half-added vault: in VAULTS but no repo key -> loud boot warning -----
+# --- 9. Half-added vault: VAULT_n_* keys without VAULT_n -> loud warning -----
 S="$(mktemp -d)"
-OUT="$(run_entry "$S" VAULTS="alpha,ghost" VAULT_ALPHA_REPO=https://example.invalid/a.git)"
+OUT="$(run_entry "$S" \
+  VAULT_1=https://example.invalid/a.git \
+  VAULT_2_SYNC_REMOTE=Ghost)"
 check "half-added vault warned about at boot" "1" \
-  "$(echo "$OUT" | grep -c "vault 'ghost' is HALF-ADDED")"
+  "$(echo "$OUT" | grep -c "vault #2 is HALF-ADDED")"
 check "the warning names the GIT_TOKEN obligation" "yes" \
   "$([ "$(echo "$OUT" | grep -c 'extend GIT_TOKEN')" -ge 1 ] && echo yes || echo no)"
-check "the fully-added sibling still launches" "1" "$(echo "$OUT" | grep -c 'LAUNCHED name=alpha')"
+check "the fully-added sibling still launches" "1" "$(echo "$OUT" | grep -c 'LAUNCHED name=a')"
 rm -rf "$S"
 
 # --- 10. Placeholder values fail closed, loudly (REAL bridge, no stub) -------
