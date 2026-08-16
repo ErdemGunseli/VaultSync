@@ -115,6 +115,20 @@ if [ -n "${VAULTS:-}" ]; then
   for name in "$@"; do
     name="${name// /}"
     [ -n "$name" ] || continue
+    # Catch a HALF-ADDED vault at boot, loudly: a name in VAULTS whose repo key
+    # is missing is a config mistake, not an intentional idle. The commonest
+    # cause is forgetting that adding a vault has THREE parts: the env keys,
+    # extending GIT_TOKEN to the new repo (fine-grained PATs enumerate
+    # repositories explicitly - a new repo is NEVER covered automatically),
+    # and the new vault's E2E password if its Sync remote is encrypted.
+    U="$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+    rv="VAULT_${U}_REPO"
+    if [ -z "${!rv:-}" ]; then
+      log "WARNING: vault '$name' is HALF-ADDED - listed in VAULTS but $rv is unset."
+      log "         Set $rv, extend GIT_TOKEN to cover the new repo, and set"
+      log "         VAULT_${U}_SYNC_ENCRYPTION_PASSWORD if its Sync remote is encrypted."
+      log "         Its bridge will idle until then."
+    fi
     supervise "$name" "" envmap
     found=$((found + 1))
   done

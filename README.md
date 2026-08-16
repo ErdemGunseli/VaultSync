@@ -119,10 +119,24 @@ because its config does.**
 
 **One vault** — set `VAULT_REPO` as a plain environment variable. Done.
 
-**Several vaults** — drop one file per vault at `$SECRETS_DIR/vault-<name>.env`.
-`vault-research.env` creates the vault `research`. Adding a vault is adding a file; removing
-one is removing a file. The filename is the vault's identity and always beats a `VAULT_NAME`
-written inside the file, so two files can never collide on one sync state.
+**Several vaults** — either name them in one env group (`VAULTS=planning,personal` plus
+`VAULT_<NAME>_REPO` / `_SYNC_REMOTE` / `_SYNC_ENCRYPTION_PASSWORD` per vault — one Render
+env group defines the whole service), or drop one file per vault at
+`$SECRETS_DIR/vault-<name>.env`. Either way, adding a vault is adding config; removing one
+is removing it.
+
+### Adding a vault is three things, not one
+
+1. Its config keys (repo URL, Sync remote name).
+2. **Extending `GIT_TOKEN` to the new repo.** Fine-grained PATs enumerate repositories
+   explicitly — a newly created repo is *never* covered by an existing token. Edit the
+   token's repository list, or mint a fresh one.
+3. **Its encryption password**, if the new Sync remote is end-to-end encrypted.
+
+The daemon catches the half-done states instead of half-working: a name listed with no
+repo key warns loudly at boot ("HALF-ADDED"), a `REPLACE_ME` placeholder anywhere in a
+vault's config is fatal with a message naming the fix, and a clone failure hints at PAT
+coverage rather than leaving a bare auth error.
 
 See [`daemon/secrets.example/vault-planning.env`](daemon/secrets.example/vault-planning.env)
 for every key, each with a comment explaining why it exists.

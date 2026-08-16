@@ -125,5 +125,27 @@ check "secret-file vault is not also launched" "0" \
   "$(echo "$OUT" | grep -c 'LAUNCHED name=filemode')"
 rm -rf "$S"
 
+# --- 9. Half-added vault: in VAULTS but no repo key -> loud boot warning -----
+S="$(mktemp -d)"
+OUT="$(run_entry "$S" VAULTS="alpha,ghost" VAULT_ALPHA_REPO=https://example.invalid/a.git)"
+check "half-added vault warned about at boot" "1" \
+  "$(echo "$OUT" | grep -c "vault 'ghost' is HALF-ADDED")"
+check "the warning names the GIT_TOKEN obligation" "yes" \
+  "$([ "$(echo "$OUT" | grep -c 'extend GIT_TOKEN')" -ge 1 ] && echo yes || echo no)"
+check "the fully-added sibling still launches" "1" "$(echo "$OUT" | grep -c 'LAUNCHED name=alpha')"
+rm -rf "$S"
+
+# --- 10. Placeholder values fail closed, loudly (REAL bridge, no stub) -------
+T="$(mktemp -d)"
+POUT="$(env -i PATH="$PATH" HOME="$T" XDG_CONFIG_HOME="$T/ob" TMPDIR="$T" \
+  VAULT_NAME=ph VAULT_DIR="$T/vault" \
+  VAULT_REPO="https://github.com/x/y.git" GIT_TOKEN="REPLACE_ME" \
+  timeout 10 bash "$HERE/../bridge.sh" 2>&1)"
+rc=$?
+check "REPLACE_ME placeholder is fatal, not a confusing auth error" "1" "$rc"
+check "the fatal message says what to fix" "yes" \
+  "$([ "$(echo "$POUT" | grep -c 'REPLACE_ME placeholder')" -ge 1 ] && echo yes || echo no)"
+rm -rf "$T"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

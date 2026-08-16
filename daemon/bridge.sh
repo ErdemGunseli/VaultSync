@@ -153,6 +153,19 @@ if [ -n "${GIT_TOKEN:-}" ]; then
   esac
 fi
 
+# Configured-but-fake is worse than unconfigured: a REPLACE_ME placeholder that
+# reaches git or ob produces a confusing auth error instead of the actual
+# problem. Fail closed and name the fix (config-minimalism: half-configured
+# must never half-work).
+if printf '%s' "${VAULT_REPO} ${GIT_TOKEN:-} ${SYNC_ENC_PW} ${OBSIDIAN_AUTH_TOKEN:-}" \
+   | grep -q 'REPLACE_ME'; then
+  log "FATAL: a config value for this vault is still the REPLACE_ME placeholder."
+  log "       Fill the real value in the env group. Adding a vault has three parts:"
+  log "       its VAULT_* keys, extending GIT_TOKEN to the new repo (fine-grained"
+  log "       PATs enumerate repos explicitly), and its E2E password if encrypted."
+  exit 1
+fi
+
 command -v git >/dev/null 2>&1 || { log "FATAL: git not installed"; exit 1; }
 HAVE_LFS=0
 if command -v git-lfs >/dev/null 2>&1; then
@@ -166,6 +179,9 @@ if [ ! -d "$VAULT_DIR/.git" ]; then
   mkdir -p "$(dirname "$VAULT_DIR")" 2>/dev/null || true
   if ! git clone --branch "$VAULT_BRANCH" "$VAULT_REPO" "$VAULT_DIR" 2>/dev/null; then
     log "FATAL: clone failed (auth? branch? network?). Not retrying blindly."
+    log "       If this vault was JUST ADDED: does GIT_TOKEN cover this repo?"
+    log "       Fine-grained PATs list repositories explicitly - a new vault's"
+    log "       repo must be added to the token (or a new token minted)."
     exit 1
   fi
 fi
