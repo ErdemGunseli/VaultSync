@@ -242,6 +242,7 @@ before bumping.
 
 | Document | What it answers |
 |---|---|
+| [`docs/setup.md`](docs/setup.md) | The full setup runbook: the owner pastes four values, an agent does the rest |
 | [`docs/architecture.md`](docs/architecture.md) | How the pieces fit, and what would make this design wrong |
 | [`docs/agent-access.md`](docs/agent-access.md) | How an agent reads a vault, and why there is no MCP server |
 | [`docs/isolation.md`](docs/isolation.md) | How a vault carries its own rules and skills without infecting other projects |
