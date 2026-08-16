@@ -11,19 +11,48 @@ Every idea note has frontmatter; only `title` and `state` are required.
 ```yaml
 ---
 title: One-line title          # required
-state: not-started             # required: not-started | started | done
+state: not-started             # required: not-started | started | done | dropped
 horizon: inbox                 # optional: inbox | now | next | later | someday
 area: software                 # optional: software | business | personal | content
 projects: []                   # optional, multi-valued (soft overlap)
 domains: []                    # optional, multi-valued (can span projects)
-depends_on: []                 # optional hard constraint (guardrail, not a ranking)
+depends_on: ["[[Other idea title]]"]  # optional hard constraint (guardrail, not a ranking)
 created: 2026-08-14
 ---
 ```
 
+`depends_on` values are **quoted `"[[wikilinks]]"`** to existing notes - quoted because
+unquoted YAML eats the brackets as flow-sequence syntax. Obsidian rewrites a wikilink on
+rename; a bare string does not, so a bare string rots silently. A `depends_on` target that
+does not resolve to a real note is an error the validator catches, not a silent no-op.
+
 **No numeric priority field, ever.** "What's next" is computed by a `/next`-style workflow
 from live context, not stored on the note. Do not add a `priority` field, a rank, or a
 sort-order number to any idea note under any name.
+
+## State and decisions
+
+`state` is `not-started | started | done | dropped`. `dropped` is how "decided against"
+gets represented - `not-started` forever is not a valid way to record rejection.
+
+Every change to `state: done` or `state: dropped` appends a dated two-line `## Decisions`
+entry **on the note itself**, in this shape:
+
+```markdown
+## Decisions
+
+- 2026-08-16: Decided to drop this - <what was decided, one line>. Alternatives
+  considered: <what else was on the table and why it lost>, one line.
+```
+
+This is what makes "remember why" work: the losing side of a call is recorded on the
+note it was called against, not only on whatever won.
+
+A decision that spans several notes - not a single idea's outcome, a corpus-level call -
+does not belong on any one note. It becomes its own `inbox/` note with `type: decision`
+tagged `#agent/decision`. See `agent-memory.mdc`'s promotion path for when a recurring
+decision graduates further (area memory / `GLOBAL.md`); this rule only fixes where a
+decision is captured, not where it's later curated.
 
 ## One idea per note
 
@@ -37,6 +66,22 @@ An idea that spans more than one project or theme gets multiple `projects`/`doma
 and `[[wikilinks]]` to related notes. It does not get filed into a folder named after the
 combination, and it does not get duplicated into two folders. Folders in this vault
 (`inbox/`, `ideas/`, `archive/`) are coarse lifecycle buckets, not a taxonomy.
+
+## Connect is required, not optional
+
+**Creating or triaging a note requires the connect step.** Search the corpus (`ideas/**`,
+`archive/**`) for related notes by title and `domains:` overlap, then add `[[wikilinks]]`
+both ways (this note and the related note) and any shared `domains:` value both should
+carry. This is a step, not a suggestion - it is how the corpus's structure emerges at all.
+
+If a genuine search turns up nothing to link, say so on the note explicitly - a line like
+"no genuine relation found" is acceptable and expected. What is not acceptable is silence:
+zero links with no note that a search happened reads as a search that never happened.
+
+**MOCs.** Once roughly five or more notes share a theme, create a `MOC - <theme>.md`
+linking them, rather than letting the theme stay implicit in scattered `domains:` tags. A
+MOC is a plain note - `[[wikilinks]]` to its members, a sentence of framing - filed
+alongside the ideas it maps, not a special type.
 
 ## Body scales with importance
 

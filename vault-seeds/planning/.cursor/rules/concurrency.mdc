@@ -1,0 +1,114 @@
+---
+description: >-
+  Multi-agent write protocol for this vault: the write cycle, what a legal edit is, when an
+  agent may resolve a merge itself, and the git verbs that are the only way to lose a note
+globs:
+alwaysApply: true
+---
+
+# Concurrent agents
+
+SCOPE: the vault repo only. These conventions, and the push-to-main default they assume,
+must never leak onto a software repository attached to the same session.
+
+Several agents write this vault at once and none can see the others. All any writer shares
+is `origin/main`; git's ref update is the only atomic operation available. **Assume the
+other agent is not following this rule** — everything below makes one compliant agent safe
+alone.
+
+## The write cycle
+
+1. `git pull --no-rebase --no-edit` before reading anything you intend to change.
+2. Read the file. Your risk window opens here, closes at push — keep it seconds, not
+   minutes; a long job is local work plus one push, never a longer window.
+3. Make the smallest edit that satisfies the request.
+4. Commit one logical change: `<area>/<note>: <what changed>` — your declaration; none
+   other is needed.
+5. `git push` — now, not at session end.
+6. Rejected? `git fetch`, diff the paths you touched against
+   `git diff --name-only $(git merge-base HEAD origin/main)..origin/main`. No overlap →
+   `git merge --no-edit origin/main` (clean) → push. Overlap → read `origin/main`'s version
+   of each overlapping file first, then resolve by the table below.
+7. After any merge, re-read every file you touched before pushing — git merges text, not
+   meaning; two agents adding the same fact differently merges clean and leaves it wrong.
+   That fix is part of your merge, not a later chore.
+8. Rejected three times → stop retrying. Put the content in a **new** `inbox/` note and
+   push that instead — a new path can't collide, and nothing is stranded when the
+   container is reclaimed. Say so in chat.
+
+**Never declare a claim** — no lock file, no "editing X" marker. A push already is the
+compare-and-swap; a claim is a weaker copy of it plus a stale-lock failure mode git doesn't
+have. Heartbeats are worse here than anywhere: each refresh is a commit, and every commit
+reaches the owner's phone within seconds.
+
+## What a legal edit looks like
+
+- **Smallest unit** — one line, bullet, or field. Never regenerate a section or file from a
+  draft in your head. Anchor no longer matches → the file moved under you: re-read and
+  retry the targeted edit, never force it through with a rewrite.
+- **Never reformat for content** — no re-wrapping, re-ordering, "while I'm here". Reflow
+  manufactures conflicts out of edits that would have merged untouched.
+- **Never delete a note** unless asked this session; emptying one is deleting it. Superseded
+  content moves to `archive/` with a link back.
+- **Renames are their own commit** — fix inbound `[[wikilink]]`s in the same commit, push
+  alone. git merges a rename cleanly; the cost is links nothing rewrites.
+- **Frontmatter: one key at a time, block-style lists.** Block `tags:` collides as two
+  additions and resolves by union; flow-style (`tags: [a, b]`) collides as one line and
+  can't be resolved without a rewrite. Never reorder keys.
+- **New notes get a name nobody else would pick** — a date plus a specific slug.
+- **A recent edit is not garbage.** One from the last hour is another session mid-flight —
+  don't revert or tidy it unless that's the task.
+- Memory files carry reconcile-before-write on top of this — see `agent-memory`.
+
+## Resolving a merge yourself
+
+Auto-resolve **only when the result keeps every line of prose from both sides.** The moment
+resolution means choosing between two pieces of writing, it is not yours to choose.
+Frontmatter is the one exception, only for the keys named here.
+
+| Collision | Resolution |
+|---|---|
+| Additions at one anchor, or adjacent | Take both, published side first; drop only exact duplicates |
+| Other side is your own earlier commit | Take both; same line, yours wins |
+| Different notes created at the same path | Keep the published one; rename yours with a discriminator |
+| `updated:` or any timestamp | The later value |
+| `state:` | Further-along value (`not-started` < `started` < `done`) |
+| `tags:`/`projects:`/`domains:`/`depends_on:` | Union: existing order, then new |
+| Any other frontmatter scalar | Keep published; `inbox/` note with both values + both SHAs |
+| Delete vs. edit | Keep the file (git already left it); `inbox/` note recording the deletion |
+| Same lines, both substantive prose | Conflicted copy |
+| Attachment or binary | Conflicted copy; never merge bytes |
+| Dotfolder file, not covered above | Stop, report in chat |
+| Rule, `.gitattributes`, `.gitignore`, `.obsidian/*.json` | Stop, report in chat — owner ratifies these |
+
+**The published side keeps the note.** Make the copy in exactly this order — backwards, it
+overwrites the note the owner is reading:
+
+    git show :2:<path> > "<name> (conflicted copy $(date -u '+%Y-%m-%d %H.%M.%S'))<ext>"
+    git checkout --theirs -- <path>
+    git add -- <path> "<the copy>"
+
+In a pull-merge `:2:` is your side, `--theirs` is `origin/main`. Never make the copy under a
+dotfolder — Sync doesn't traverse them, so it's visible to agents and no device; route that
+collision to "stop, report" instead.
+
+**Small and specific goes to `inbox/` instead.** A conflicted copy freezes the note for
+every agent until a human reconciles it — spend one only when both full versions genuinely
+need to sit side by side. Never touch a note that already has one: per the constitution,
+that's the owner's.
+
+## Banned verbs
+
+`push --force[-with-lease]`, `merge -X ours|theirs`, `reset --hard` onto anything pushed,
+rebasing pushed commits, `commit --amend` on a pushed commit, `git checkout <sha> -- <path>`
+to "restore" over a newer file, and `checkout --ours|--theirs` — except the middle line of
+the conflicted-copy procedure above, where the discarded side is already in the copy.
+
+That list is the whole safety story: **an honest merge cannot silently lose a committed
+line.** A stale rewrite over another agent's edit conflicts loudly; a deletion racing an
+edit leaves the edit in the tree. Every banned verb discards a side without reading it.
+Restore lost text by re-applying it as a targeted edit, never by checking out an old SHA.
+
+Before committing, run `git diff --cached --numstat`: a file you didn't create this session
+showing more than a handful of removed lines you didn't intend is a stale whole-file
+rewrite — re-read, redo as a targeted edit, and say so in chat.

@@ -1,89 +1,124 @@
 ---
-description: Two-layer agent memory under .agent-memory - INDEX routing, per-area curated memory with provenance dates, append-only session logs, targeted edits only, no silent forgetting
-globs: Notes/**,.agent-memory/**
-alwaysApply: false
+description: Two-layer agent memory under .agent-memory - bookkeeping only; durable knowledge is published to the corpus. Fact-line format, reconcile-before-write, no silent forgetting.
+globs:
+alwaysApply: true
 ---
 
 # Agent memory
 
-This vault carries two kinds of agent memory, both under the dotfolder `.agent-memory/` —
-invisible to Obsidian's UI and to Obsidian Sync, carried only by git. Never move memory
-content into a visible folder, and never treat a visible note as memory infrastructure.
+SCOPE: `.agent-memory/` in the vault repo only. Never applies to a software repository
+attached to the same session.
 
-## The two layers
+Both layers live under the dotfolder `.agent-memory/` — invisible to Obsidian's UI and Sync,
+carried only by git. Never treat a visible note as memory infrastructure: no routing tables,
+session logs, or staleness bookkeeping in the corpus, ever. **Memory holds the bookkeeping;
+the corpus holds the knowledge.** Machinery stays hidden permanently; knowledge an agent
+produces — a decision, a finding, a deadline the owner must meet, an approach that failed —
+is *published* into the corpus (below), never buried where no phone can open it.
 
-**Episodic** — `.agent-memory/sessions/YYYY-MM-DD-<session>.md`. One file per session,
-append-only, written by the session itself as it works. A running record of what happened,
-never curated, never read by default. Read a specific one only when explicitly asked for
-past-session context.
+**Episodic** — `.agent-memory/sessions/YYYY-MM-DD-<session>.md`, one per session,
+append-only, not read by default, cannot collide (a session names its own file). **Durable**
+— `.agent-memory/areas/<slug>/memory.md`, one per topic, plus `GLOBAL.md` for facts spanning
+areas; curated, in-place-edited, small.
 
-**Durable** — `.agent-memory/areas/<area-slug>/memory.md`, one per topic area, plus
-`.agent-memory/GLOBAL.md` for facts that span areas. Curated, in-place-edited, small. This is
-where current status, deadlines, open tasks, watch items, contacts, and completed history
-live — read *before* acting on that area, updated *as* facts change, never left to drift.
+## Cold start
 
-## Cold start: read this first, always
+Read `.agent-memory/INDEX.md` first, always. It's a routing table: area slug, routing keys,
+memory file path, updated date. A routing key is a path glob only where the vault actually
+files by taxonomy — this vault files ideas flat and overlaps by tag, so `ideas/**` matches
+every area and discriminates nothing. There, keys are the corpus's own `projects`/`domains`
+values and topic words; at least one key per row must genuinely discriminate. Skim
+`GLOBAL.md` too — small by construction.
 
-Read `.agent-memory/INDEX.md` before anything else in this vault. It is a small routing
-table — area slug, scope glob, memory file path, last-updated date — nothing else. Match your
-task's path or topic against its `scope` globs; if one matches, read that area's `memory.md`
-before you act. Skim `GLOBAL.md` too; it is small by construction. Do not read session logs
-unless specifically asked for history — they are not part of the default read path.
+No row matches? `rg` across `.agent-memory/**` for the topic before concluding nothing is
+known — the INDEX is routing, not the only way in. Still nothing and the task is durable
+and recurring: create `areas/<slug>/memory.md` plus its INDEX row, rather than letting the
+fact drift into GLOBAL by default or live nowhere.
 
-No area matches and the task is genuinely durable and recurring? Create one (new
-`areas/<slug>/memory.md` from the template below, plus its row in `INDEX.md`) rather than
-letting the fact live nowhere or drift into GLOBAL by default.
+## Fact lines
 
-## Area memory file shape
+Every Key Facts / Key Deadlines entry is one line, bi-temporal, sourced:
 
-Frontmatter: `type: area-memory`, `area:`, `scope:` (the glob this file tracks), `updated:`,
-`tags:`. Body, fixed headings, in this order: `Status`, `Key Facts`, `Key Deadlines`, `Open
-Tasks`, `Watch Items / Open Questions`, `Contacts`, `Completed / Done`, `Source Notes`.
+    - <slot> :: <value> | valid <YYYY-MM-DD>- | confirmed <YYYY-MM-DD> | [[source or session]]
 
-**Every fact in Key Facts and Key Deadlines carries its provenance and its as-of date** —
-`(source: <office/doc/URL>, as of YYYY-MM-DD)`. A fact with no date is not durable memory,
-it's a guess with a byline. Before acting on a fact whose date is older than the area's own
-volatility warrants (a visa deadline sooner than a contact's email), re-verify or move it to
-Watch Items — never act on a silently-aged fact.
+`valid` is when the fact became/becomes true in the world; `confirmed` is when an agent last
+verified it — git's own commit history is the transaction-time record on top of this, never
+re-invent it with a second date. Re-confirming an unchanged value bumps `confirmed:` and
+appends the session ref; it does not duplicate the line.
 
-## Writing to durable memory: targeted edits only, never a whole-file rewrite
+## Reconcile before writing a durable fact
 
-Area `memory.md` files, `INDEX.md`, and `GLOBAL.md` are all in-place-edited, on purpose — a
-single current-state note is the point. That means contention is real and is handled by
-discipline, the same way `subagent-orchestration.mdc` handles it for code: **the smallest
-matching edit only** — one checklist line, one bullet under an existing heading, one table
-row — never a section or whole-file regeneration from a draft held in your own head. Re-read
-the file immediately before writing if any time has passed since you last read it this turn.
-Bump `updated:` on every edit. If your edit's anchor text no longer matches, the file changed
-under you — re-read and retry the targeted edit; do not fall back to rewriting the file to
-force it through.
+Before appending, scan the area file for the same `<slot>`:
 
-Session logs stay append-only, one file per session, per the existing convention — this is
-the same underlying rule (smallest edit, no stale whole-file rewrite) applied to a case where
-structure alone already prevents collision.
+- **same slot, different value** → supersede: stamp the old line's end date, cut it under
+  the fixed `## Superseded` heading with the date, note what replaced it.
+- **same slot, same value** → don't duplicate: bump `confirmed:`, append the session ref.
+- **same slot, both true at once** (a person speaks two languages; an address changed on a
+  known date) → accrue: both lines stand, each dated — never let the guard against
+  duplicates collapse two facts that hold simultaneously.
+- **contradicts an existing fact and you can't tell which is right** → don't guess; add both
+  to Watch Items with the disagreement stated, never silently pick one.
+- no matching slot → append.
 
-## Compaction and staleness — no silent forgetting
+Compaction may fold old `Superseded` entries into a dated one-line summary; it may never
+delete one that an open task, a Watch Item, or another note still references.
 
-When a section outgrows a few hundred lines, fold old entries into a dated one-line summary;
-move truly dead detail to a visible `archive/` note or drop it only once nothing open still
-depends on it. Never delete an open deadline, open task, or active contact to make room.
+## Publishing to the corpus
 
-**No fact is ever auto-expired.** An aging fact moves to Watch Items as needing
-reconfirmation and stays visible there until an agent actually reconfirms or supersedes it —
-silently dropping an unresolved fact is the same offense `test-integrity.mdc` names for tests,
-applied to memory.
+Two questions decide whether something is memory or a note. Both must hold:
 
-Review is opportunistic: whenever you read an area file to act on it, you are already
-obligated to check whether anything you're about to rely on needs reconfirming.
+1. Would it still be worth keeping if the agent layer vanished tomorrow?
+2. Can it be stated without naming an agent, a session, a rule, or a memory file?
 
-## Promotion between area and global
+Both yes → publish. Either no → stays in memory. Routing rows, session logs, staleness
+flags, coverage lists and standing agent preferences fail #2 and never leave
+`.agent-memory/`. Decisions, findings, dead ends and the owner's own deadlines pass both.
 
-A fact that recurs across two or more areas moves to `GLOBAL.md`; a `GLOBAL.md` fact that
-turns out to only ever matter to one area moves back down. Don't duplicate a fact into two
-area files — promote it once, to the one place it belongs.
+- Concerns **one** note → append it there under a `## Decisions` heading, dated, marked
+  `(decided with owner, YYYY-MM-DD)` when the choice was the owner's.
+- Concerns **two or more** → its own note in `inbox/`, `type: decision`, `state: done`,
+  tagged `#agent/decision`, linking each note it decided.
+
+**Single source.** Memory never holds a second authoritative copy of a fact that belongs in
+a note; a one-line dated echo beside the link is fine, but the note wins on disagreement.
+
+## Links: memory names notes, never the reverse
+
+`[[…]]` inside `.agent-memory/**` always means a note in the visible corpus, folder-qualified
+from the vault root, `.md` omitted (`[[ideas/Cross-repo skills registry]]`) — never a memory
+file (use a plain relative path for those: `areas/foo/memory.md`). Frontmatter links are
+quoted: `covers: ["[[ideas/X]]"]`. Never link from a visible note into a hidden path in any
+syntax — it renders dead and is destructive if clicked; publish instead. After the pull the
+write cycle already requires, check
+`git diff --name-status -M <last-seen>..HEAD -- ':!.agent-memory'` and repair any renamed
+targets in one pass; a link that still won't resolve is a Watch Item, never a silent drop.
+
+**Area memory file shape.** Frontmatter: `type: area-memory`, `area:`, `covers:` (quoted
+links to the notes this area tracks plus the tags it owns), routing keys, `updated:`,
+`tags:`. Body, fixed headings in order: `Status`, `Key Facts`, `Key Deadlines`, `Open
+Tasks`, `Watch Items`, `Contacts`, `Published` (what this area promoted, so nobody
+re-decides it), `Superseded`, `Completed / Done`, `Source Notes`.
+
+## Writing: targeted edits, no silent forgetting
+
+Smallest matching edit — one line, bullet, or row — never a section or whole-file rewrite;
+bump `updated:` on every edit. `concurrency.mdc` governs the git mechanics of writing any
+vault file, including these. An aging fact moves to Watch Items, not to nowhere, and stays
+until reconfirmed or superseded — never delete an open deadline, task, or active contact to
+make room.
+
+## Promotion, procedure vs. facts, session end
+
+Before moving a fact to `GLOBAL.md` because it spans two areas, check whether it should have
+been a note instead — a person, deadline, decision or finding two areas depend on is a note
+both link, not a global row; `GLOBAL.md` is for what fails the publication test above:
+standing agent preferences and cross-area bookkeeping. An area rule (`agent-authoring.mdc`)
+states what to do; a memory file states what is true — a recurring fact belongs in memory,
+never folded into a rule as an example. Before a session closes, distill anything durable
+it produced from the session log into the right area file (reconciled per above) or publish
+it — an unread episodic log is a discard, not memory.
 
 ## Governance
 
-Ordinary reads and writes under `.agent-memory/**` need no ratification — this is agent
-infrastructure, the same bucket as `inbox/`/`ideas/` writes. Changing *this rule* follows the
-vault's normal rule-change governance.
+Ordinary reads and writes under `.agent-memory/**` need no ratification. Changing this rule
+follows the vault's baseline governance — an agent proposes in `inbox/`, the owner ratifies.
