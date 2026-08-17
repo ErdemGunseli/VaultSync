@@ -1,5 +1,5 @@
 ---
-paths: **/*.md
+paths: "**/*.md"
 ---
 
 # Persistence: main is the delivery surface

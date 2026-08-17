@@ -1,6 +1,6 @@
 ---
 description: Agents create area rules, note-format standards, skills and memory directly (announced, pushed to main); baseline rules still need owner ratification
-globs: Notes/**,.agent-memory/**
+globs: **/*.md
 alwaysApply: false
 ---
 
@@ -35,14 +35,17 @@ the turn that pushed it - creation is visible, never silent.
 ## What still needs the owner's ratification
 
 The **baseline** - the constitution, the persistence rule, the agent-memory rule, this
-rule, and anything governing sync, secrets, or access. Propose changes to those as a note
-in `inbox/` and stop; the owner ratifies. The line: agents extend the system freely,
-but do not amend its foundations on their own.
+rule, and anything governing sync, secrets, or access. Propose changes to those as a
+note tagged `#agent/proposal` - anywhere in the vault, folders carry no semantics - and
+stop; the owner ratifies. The line: agents extend the system freely, but do not amend
+its foundations on their own.
 
 ## Quality bar
 
 A rule an agent writes binds every future agent, so it is held to the factory's standard:
 state the dominant evidenced pattern, never launder one session's inconsistency into
-house style; scope with directory-prefixed globs (a bare leading `*` is invalid YAML and
-a silent no-load); keep it as short as the obligation allows; and when a rule's subject
+house style; scope vault-wide with `**/*.md` unless the rule is genuinely about one
+area - folders carry no semantics, so a folder-scoped rule silently misses notes it
+should govern (the sync tool quotes the generated `paths:` value, which is what keeps a
+leading `*` valid YAML); keep it as short as the obligation allows; and when a rule's subject
 changes, the same turn updates the rule - a stale rule is worse than none.

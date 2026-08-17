@@ -38,7 +38,10 @@ def convert_rule(src: Path) -> str:
     for line in front.splitlines():
         if line.startswith("globs:"):
             globs = line.split(":", 1)[1].strip()
-    header = f"---\npaths: {globs}\n---\n" if globs else "---\n---\n"
+    # Quote the value: Cursor's globs: must stay a bare comma list, but in the
+    # generated YAML a bare leading '*' is alias syntax (invalid), so the
+    # Claude paths: field carries the same string quoted.
+    header = f'---\npaths: "{globs}"\n---\n' if globs else "---\n---\n"
     return header + body
 
 
