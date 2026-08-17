@@ -81,7 +81,7 @@ def should_skip(path: Path, root: Path) -> bool:
     rel_parts = path.relative_to(root).parts
     if any(p in SKIP_DIR_NAMES for p in rel_parts):
         return True
-    if path.name.lower() == "readme.md":
+    if path.name.lower() in ("readme.md", "agents.md"):
         return True
     return False
 
@@ -421,6 +421,9 @@ def strip_code_blocks(text: str) -> str:
         if re.match(r"^ {4,}\S", line) or line.startswith("\t"):
             out.append("")
             continue
+        # Inline code spans are format-mentions too (`[[wikilinks]]` as prose);
+        # blank them with same-length padding so line numbers stay accurate.
+        line = re.sub(r"`[^`\n]+`", lambda m: " " * len(m.group(0)), line)
         out.append(line)
     return "\n".join(out)
 

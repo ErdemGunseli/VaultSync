@@ -62,6 +62,18 @@ deletes, or picks a winner between a note and its conflicted copy. If your work 
 by one, flag it and stop. Git history holds every side of every conflict, so nothing you do
 can be the only copy of anything - but resolution is still a human decision.
 
+## What belongs in this vault, versus in a code repository
+
+Ratified boundary (owner, 2026-08-17): this vault is the **human thinking surface** -
+vision, backlogs, strategy, shared docs, research written for humans, ideas and their
+states. Anything a person creates or interacts with *as planning* lives here as the
+source of truth, and agents reference it from here. Code repositories are the machine
+execution surface: code, records rule-bound to code (ledgers, canonical docs), and
+AI-written implementation plans, whose audience is the executing agent. A document is
+never dual-homed - one side is the source, the other at most a pointer or generated
+mirror. When an implementation plan graduates to something the owner works with as
+planning, it moves here deliberately and the repo copy becomes the pointer.
+
 ## Scope of authority: this vault, and nothing it points at
 
 Every rule in this vault - this file included - governs how an agent interacts with **this
