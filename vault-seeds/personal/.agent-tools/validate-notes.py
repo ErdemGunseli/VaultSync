@@ -10,10 +10,13 @@ _templates/ (templates, not real notes), and any file named README.md (vault
 documentation, not an idea note).
 
 Checks (see idea-notes.mdc / agent-memory.md for the rules these enforce):
-  1. Every scanned .md has frontmatter with title + state, state in
-     {not-started, started, done, dropped}. A note missing this is "missing
-     metadata" - not an error to fix by moving it anywhere, an error to fix by
-     adding the frontmatter in place (enrichment; see --enrich-list below).
+  1. CORPUS VAULTS ONLY (vaults carrying .cursor/rules/idea-notes.mdc): every
+     scanned .md has frontmatter with title + state, state in {not-started,
+     started, done, dropped}. A note missing this is "missing metadata" - not an
+     error to fix by moving it anywhere, an error to fix by adding the
+     frontmatter in place (enrichment; see --enrich-list below). Vaults without
+     that rule (document vaults) skip this and the connect-step warning; the
+     state enum is still enforced wherever a state field IS present.
   2. depends_on entries, when present, are quoted wikilinks "[[...]]" and resolve
      to an existing note (path or basename, .md optional) anywhere in the vault.
   3. Frontmatter parses at all - a tolerant hand-rolled checker (stdlib only, no
@@ -47,6 +50,14 @@ import sys
 from pathlib import Path
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
+
+# The floor schema (title/state) is the PLANNING CORPUS contract, declared by the
+# presence of the idea-notes rule in the vault being validated. A vault without
+# it (e.g. a personal document vault) gets only the universal checks: YAML traps,
+# state-enum-if-present, memory-file consistency, folder-qualified memory links,
+# and the size cap. Documents are not ideas.
+def is_corpus(root: Path) -> bool:
+    return (root / ".cursor" / "rules" / "idea-notes.mdc").is_file()
 
 SKIP_DIR_NAMES = {
     ".git", ".obsidian", ".agent-tools", ".claude", ".cursor", ".agent-memory",
@@ -251,13 +262,15 @@ def read_floor_schema(p: Path):
 def check_notes(root: Path, note_index: dict[str, list[Path]]):
     errors: list[tuple[str, str]] = []
     warnings: list[tuple[str, str]] = []
+    corpus = is_corpus(root)
 
     for p in iter_note_files(root):
         rel = str(p.relative_to(root))
         fm_raw, body, fields, parse_errors, title, state_present, state_val = read_floor_schema(p)
 
         if fm_raw is None:
-            errors.append((rel, "no YAML frontmatter block (file must start with '---' ... '---')"))
+            if corpus:
+                errors.append((rel, "no YAML frontmatter block (file must start with '---' ... '---')"))
             continue
         if fm_raw is FM_UNTERMINATED:
             errors.append((rel, "frontmatter opened with '---' but never closed with a second '---'"))
@@ -266,12 +279,12 @@ def check_notes(root: Path, note_index: dict[str, list[Path]]):
         for e in parse_errors:
             errors.append((rel, f"frontmatter parse issue - {e}"))
 
-        if not title:
+        if corpus and not title:
             errors.append((rel, "frontmatter missing required field 'title'"))
 
-        if not state_present:
+        if corpus and not state_present:
             errors.append((rel, "frontmatter missing required field 'state'"))
-        elif state_val not in VALID_STATES:
+        elif state_present and state_val not in VALID_STATES:
             errors.append((rel, f"state '{state_val}' is not one of {sorted(VALID_STATES)}"))
 
         for item in get_list_items(fields, "depends_on"):
@@ -284,11 +297,12 @@ def check_notes(root: Path, note_index: dict[str, list[Path]]):
                     (rel, f"depends_on target does not resolve to an existing note: {target!r}")
                 )
 
-        # Connect step applies to every note, wherever it lives - folders don't
-        # distinguish "idea" from "capture" anymore.
+        # Connect step applies to every corpus note, wherever it lives - folders
+        # don't distinguish "idea" from "capture" anymore. Document vaults are
+        # not under the connect obligation, so no warning noise there.
         has_link = bool(WIKILINK_ANY_RE.search(body))
         has_marker = "no genuine relation" in body.lower()
-        if not has_link and not has_marker:
+        if corpus and not has_link and not has_marker:
             warnings.append(
                 (rel, 'zero outgoing [[wikilinks]] and no "no genuine relation found" marker')
             )
@@ -302,6 +316,8 @@ def check_notes(root: Path, note_index: dict[str, list[Path]]):
 # --------------------------------------------------------------------------
 
 def enrich_list(root: Path) -> list[str]:
+    if not is_corpus(root):
+        return []  # no floor schema, nothing to enrich - never fires on document vaults
     missing: list[str] = []
     for p in iter_note_files(root):
         _, _, _, _, title, state_present, state_val = read_floor_schema(p)

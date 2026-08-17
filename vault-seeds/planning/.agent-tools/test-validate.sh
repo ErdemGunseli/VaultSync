@@ -18,7 +18,13 @@ fail() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; echo "  -- $2"; }
 make_base_vault() {
   local dir="$1"
   mkdir -p "$dir"/inbox "$dir"/ideas "$dir"/archive \
-           "$dir"/.agent-memory/areas/foo "$dir"/.agent-memory/sessions
+           "$dir"/.agent-memory/areas/foo "$dir"/.agent-memory/sessions \
+           "$dir"/.cursor/rules
+
+  # Corpus marker: the floor schema (title/state, connect step, enrichment)
+  # only applies to vaults carrying the idea-notes rule. Fixtures are corpus
+  # vaults so those checks stay exercised.
+  echo "# fixture corpus marker" > "$dir/.cursor/rules/idea-notes.mdc"
 
   cat > "$dir/ideas/valid.md" <<'EOF'
 ---
@@ -264,6 +270,50 @@ else
 --- output ---
 $out"
 fi
+
+# 15. NON-CORPUS vault (no idea-notes.mdc): documents without frontmatter are
+# fine, no connect warning, --enrich-list is empty - the floor schema is the
+# planning-corpus contract, never imposed on a document vault. Universal checks
+# still hold: a state field that IS present must use the enum.
+make_base_vault "$TMP/document-vault"
+rm "$TMP/document-vault/.cursor/rules/idea-notes.mdc"
+mkdir -p "$TMP/document-vault/notes"
+cat > "$TMP/document-vault/notes/lecture.md" <<'EOF'
+# Lecture 4 - Databases
+
+Plain document, no frontmatter, no wikilinks. Perfectly fine here.
+EOF
+run_case "document vault: bare .md passes with no warnings" "$TMP/document-vault" 0
+out="$(python3 "$VALIDATE" "$TMP/document-vault" 2>&1)"
+if grep -q "zero outgoing" <<<"$out"; then
+  fail "document vault: no connect-step warning" "warned anyway
+--- output ---
+$out"
+else
+  pass "document vault: no connect-step warning"
+fi
+out="$(python3 "$VALIDATE" "$TMP/document-vault" --enrich-list 2>&1)"
+code=$?
+if [ "$code" -eq 0 ] && [ -z "$out" ]; then
+  pass "document vault: --enrich-list is empty (enrichment never fires)"
+else
+  fail "document vault: --enrich-list is empty (enrichment never fires)" "exit=$code
+--- output ---
+$out"
+fi
+
+# 16. NON-CORPUS vault: a present-but-invalid state still fails (the enum is
+# universal wherever the field exists).
+make_base_vault "$TMP/document-vault-badstate"
+rm "$TMP/document-vault-badstate/.cursor/rules/idea-notes.mdc"
+cat > "$TMP/document-vault-badstate/tracked.md" <<'EOF'
+---
+title: Opted into state tracking
+state: someday
+---
+Body.
+EOF
+run_case "document vault: invalid state value still fails" "$TMP/document-vault-badstate" 1 "not one of"
 
 echo
 echo "== $PASS passed, $FAIL failed =="
