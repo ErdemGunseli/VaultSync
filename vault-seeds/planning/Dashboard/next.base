@@ -1,0 +1,84 @@
+# next.base — launch-ready candidates: horizon == next AND no open hard dependencies.
+#
+# IMPORTANT CAVEAT ON "depends_on satisfied":
+# Bases filters operate on each note in isolation; an expression CANNOT follow a
+# `depends_on: [other-idea]` link and read whether *that other note's* state == done.
+# So this base can only honestly enforce the *structural* half of the rule:
+#     horizon == next  AND  depends_on is empty   (no declared blockers)
+# The richer "deps_on are all DONE" check is a graph traversal — that belongs to the
+# /next selection sub-agent (PLAN §5.6), which reasons over the corpus. This view is
+# the fast structural pre-filter; /next does the real dependency-clearance reasoning.
+#
+# (If you want a middle ground in pure Bases, add a `blocked: true` flag to a note
+# whose deps aren't done — set by an agent during enrichment — and filter `blocked != true`.
+# That keeps it a derived flag, not a numeric priority, consistent with Principles 5/6.)
+#
+# FOLDERS CARRY ZERO SEMANTICS in this vault (idea-notes.mdc) — scope by
+# property (horizon/state), not location: a launch-ready note can live anywhere.
+
+filters:
+  and:
+    - 'file.ext == "md"'
+    - 'horizon == "next"'
+    - 'state != "done"'
+    - 'state != "dropped"'
+    - 'depends_on.isEmpty()'
+
+formulas:
+  ready: '"▶ ready"'
+
+properties:
+  state:
+    displayName: "State"
+  area:
+    displayName: "Area"
+  projects:
+    displayName: "Projects"
+  domains:
+    displayName: "Domains"
+  formula.ready:
+    displayName: "Status"
+  file.name:
+    displayName: "Idea"
+
+views:
+  # The shortlist. Open /next over this, or click into an idea and hit its launch button.
+  - type: table
+    name: "Next — ready to pick up"
+    order:
+      - file.name
+      - formula.ready
+      - state
+      - area
+      - projects
+      - domains
+    sort:
+      - property: state
+        direction: ASC
+
+  # Same shortlist as cards, grouped by area so `/next software` is one glance away.
+  - type: cards
+    name: "Next by area"
+    order:
+      - file.name
+      - state
+      - projects
+    groupBy:
+      property: area
+      direction: ASC
+
+  # Companion view: `next` ideas that ARE blocked (have declared deps) — so you can
+  # see what's queued behind a dependency without it polluting the ready list.
+  - type: table
+    name: "Next — blocked (has deps)"
+    filters:
+      and:
+        - 'horizon == "next"'
+        - 'state != "done"'
+        - 'state != "dropped"'
+        - '!depends_on.isEmpty()'
+    order:
+      - file.name
+      - state
+      - depends_on
+      - projects

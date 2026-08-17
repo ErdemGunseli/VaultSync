@@ -208,6 +208,63 @@ Searched the corpus - no genuine relation found.
 EOF
 run_case "marked no-relation idea does not warn" "$TMP/marker-ok" 0
 
+# 11. a note outside inbox/ideas/archive (folders carry no semantics - any
+# location is scanned) with a bad state still fails.
+make_base_vault "$TMP/anywhere-bad"
+mkdir -p "$TMP/anywhere-bad/projects/quantsoc"
+cat > "$TMP/anywhere-bad/projects/quantsoc/loose-note.md" <<'EOF'
+---
+title: A note filed nowhere special
+state: maybe-someday
+---
+Body [[ideas/valid]]
+EOF
+run_case "note outside the old note-dirs is still scanned" "$TMP/anywhere-bad" 1 "not one of"
+
+# 12. Dashboard/ and _templates/ are never scanned for floor schema, even
+# though they hold .md files with no frontmatter.
+make_base_vault "$TMP/dashboard-skip"
+mkdir -p "$TMP/dashboard-skip/Dashboard" "$TMP/dashboard-skip/_templates"
+cat > "$TMP/dashboard-skip/Dashboard/Notes.md" <<'EOF'
+# Not an idea note, no frontmatter at all.
+EOF
+cat > "$TMP/dashboard-skip/_templates/idea.md" <<'EOF'
+---
+title:
+state: not-started
+---
+Template body.
+EOF
+run_case "Dashboard/ and _templates/ are excluded from the floor-schema check" "$TMP/dashboard-skip" 0
+
+# 13. --enrich-list prints notes missing the floor schema and exits 0 (a
+# report, not a gate) - the automatic-enrichment obligation's data source.
+make_base_vault "$TMP/enrich-list"
+cat > "$TMP/enrich-list/ideas/needs-enrichment.md" <<'EOF'
+Just a capture with no frontmatter at all.
+EOF
+out="$(python3 "$VALIDATE" "$TMP/enrich-list" --enrich-list 2>&1)"
+code=$?
+if [ "$code" -eq 0 ] && grep -qF "ideas/needs-enrichment.md" <<<"$out"; then
+  pass "--enrich-list finds a note missing the floor schema"
+else
+  fail "--enrich-list finds a note missing the floor schema" "exit=$code
+--- output ---
+$out"
+fi
+
+# 14. --enrich-list is silent (and still exit 0) over a fully-enriched vault.
+make_base_vault "$TMP/enrich-list-clean"
+out="$(python3 "$VALIDATE" "$TMP/enrich-list-clean" --enrich-list 2>&1)"
+code=$?
+if [ "$code" -eq 0 ] && [ -z "$out" ]; then
+  pass "--enrich-list is silent over a fully-enriched vault"
+else
+  fail "--enrich-list is silent over a fully-enriched vault" "exit=$code
+--- output ---
+$out"
+fi
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

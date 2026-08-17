@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Vault note/memory validator - the one enforcement mechanism for the floor schema.
 
+Folders carry ZERO semantics in this vault (see idea-notes.mdc): a note can live
+anywhere and is never relocated. So this validator scans every .md file in the
+vault, wherever it sits, except: dotfolders (.git .obsidian .agent-tools .claude
+.cursor .agent-memory - the last has its own schema, enforced by checks 4-5
+below, not the idea floor schema), Dashboard/ (views/docs, not notes),
+_templates/ (templates, not real notes), and any file named README.md (vault
+documentation, not an idea note).
+
 Checks (see idea-notes.mdc / agent-memory.md for the rules these enforce):
-  1. Every .md under inbox/ ideas/ archive/ has frontmatter with title + state,
-     state in {not-started, started, done, dropped}. (README.md files in those
-     folders are vault documentation, not idea notes, and are skipped.)
+  1. Every scanned .md has frontmatter with title + state, state in
+     {not-started, started, done, dropped}. A note missing this is "missing
+     metadata" - not an error to fix by moving it anywhere, an error to fix by
+     adding the frontmatter in place (enrichment; see --enrich-list below).
   2. depends_on entries, when present, are quoted wikilinks "[[...]]" and resolve
-     to an existing note (path or basename, .md optional).
+     to an existing note (path or basename, .md optional) anywhere in the vault.
   3. Frontmatter parses at all - a tolerant hand-rolled checker (stdlib only, no
      PyYAML) that catches the two documented traps: unquoted [[..]] eaten as a
      YAML flow sequence, and a bare leading '*' (YAML alias syntax).
@@ -14,18 +23,22 @@ Checks (see idea-notes.mdc / agent-memory.md for the rules these enforce):
      areas/*/memory.md on disk has a row (checked both directions).
   5. Wikilinks inside .agent-memory/** are folder-qualified (contain a '/'),
      per the memory rules.
-  6. Warnings (do not fail the run): an ideas/ note with zero outgoing
-     [[links]] and no "no genuine relation found" marker; any file >4.5MB
+  6. Warnings (do not fail the run): a note with zero outgoing [[links]] and no
+     "no genuine relation found" marker (the connect step); any file >4.5MB
      outside .git (approaching the 5MB sync cap).
 
 Usage, from anywhere (path is derived from this script's own location, or pass
 an explicit vault root):
   python3 .agent-tools/validate-notes.py             # report problems, exit 1 if any
   python3 .agent-tools/validate-notes.py --quiet      # errors only, minimal output, for hooks
+  python3 .agent-tools/validate-notes.py --enrich-list  # list notes missing the floor
+                                                         # schema (title/state), one path
+                                                         # per line, for the enrichment
+                                                         # obligation in idea-notes.mdc
   python3 .agent-tools/validate-notes.py /path/vault  # explicit root (used by tests)
 
-Deliberately does not check anything beyond the six items above. Do not extend
-this file's checks without updating the ratified enforcement list it implements.
+Deliberately does not check anything beyond the items above. Do not extend this
+file's checks without updating the ratified enforcement list it implements.
 """
 from __future__ import annotations
 
@@ -35,8 +48,10 @@ from pathlib import Path
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 
-NOTE_DIRS = ("inbox", "ideas", "archive")
-SKIP_DIR_NAMES = {".git", ".obsidian", ".agent-tools", ".claude", ".cursor"}
+SKIP_DIR_NAMES = {
+    ".git", ".obsidian", ".agent-tools", ".claude", ".cursor", ".agent-memory",
+    "Dashboard", "_templates",
+}
 VALID_STATES = {"not-started", "started", "done", "dropped"}
 MAX_BYTES = int(4.5 * 1024 * 1024)
 
@@ -55,7 +70,7 @@ def should_skip(path: Path, root: Path) -> bool:
     rel_parts = path.relative_to(root).parts
     if any(p in SKIP_DIR_NAMES for p in rel_parts):
         return True
-    if len(rel_parts) >= 2 and rel_parts[0] == "Dashboard" and path.suffix == ".base":
+    if path.name.lower() == "readme.md":
         return True
     return False
 
@@ -186,20 +201,14 @@ def check_depends_on_item(item: str):
 
 
 # --------------------------------------------------------------------------
-# note index (for depends_on resolution)
+# note index (for depends_on resolution) - vault-wide, folders carry no meaning
 # --------------------------------------------------------------------------
 
 def iter_note_files(root: Path):
-    for base in NOTE_DIRS:
-        d = root / base
-        if not d.is_dir():
+    for p in sorted(root.rglob("*.md")):
+        if should_skip(p, root):
             continue
-        for p in sorted(d.rglob("*.md")):
-            if should_skip(p, root):
-                continue
-            if p.name.lower() == "readme.md":
-                continue
-            yield p
+        yield p
 
 
 def build_note_index(root: Path) -> dict[str, list[Path]]:
@@ -219,6 +228,23 @@ def resolve_target(target: str, note_index: dict[str, list[Path]]) -> bool:
 
 
 # --------------------------------------------------------------------------
+# floor-schema inspection, shared by the strict checker and --enrich-list
+# --------------------------------------------------------------------------
+
+def read_floor_schema(p: Path):
+    """Returns (fm_raw, body, fields, parse_errors, title, state_present, state_val)."""
+    text = read_text(p)
+    fm_raw, body = extract_frontmatter_block(text)
+    if fm_raw is None or fm_raw is FM_UNTERMINATED:
+        return fm_raw, body, {}, [], "", False, ""
+    fields, parse_errors = parse_frontmatter_lines(fm_raw.split("\n"))
+    title = strip_scalar(fields.get("title", {}).get("inline", ""))
+    state_present = "state" in fields and bool(fields["state"]["inline"].strip())
+    state_val = strip_scalar(fields["state"]["inline"].split("#", 1)[0]) if state_present else ""
+    return fm_raw, body, fields, parse_errors, title, state_present, state_val
+
+
+# --------------------------------------------------------------------------
 # check 1-3 + 6a: per-note frontmatter and connect-step warning
 # --------------------------------------------------------------------------
 
@@ -228,8 +254,7 @@ def check_notes(root: Path, note_index: dict[str, list[Path]]):
 
     for p in iter_note_files(root):
         rel = str(p.relative_to(root))
-        text = read_text(p)
-        fm_raw, body = extract_frontmatter_block(text)
+        fm_raw, body, fields, parse_errors, title, state_present, state_val = read_floor_schema(p)
 
         if fm_raw is None:
             errors.append((rel, "no YAML frontmatter block (file must start with '---' ... '---')"))
@@ -238,22 +263,16 @@ def check_notes(root: Path, note_index: dict[str, list[Path]]):
             errors.append((rel, "frontmatter opened with '---' but never closed with a second '---'"))
             continue
 
-        fields, parse_errors = parse_frontmatter_lines(fm_raw.split("\n"))
         for e in parse_errors:
             errors.append((rel, f"frontmatter parse issue - {e}"))
 
-        title = strip_scalar(fields.get("title", {}).get("inline", ""))
         if not title:
             errors.append((rel, "frontmatter missing required field 'title'"))
 
-        if "state" not in fields or not fields["state"]["inline"].strip():
+        if not state_present:
             errors.append((rel, "frontmatter missing required field 'state'"))
-        else:
-            state_val = strip_scalar(fields["state"]["inline"].split("#", 1)[0])
-            if state_val not in VALID_STATES:
-                errors.append(
-                    (rel, f"state '{state_val}' is not one of {sorted(VALID_STATES)}")
-                )
+        elif state_val not in VALID_STATES:
+            errors.append((rel, f"state '{state_val}' is not one of {sorted(VALID_STATES)}"))
 
         for item in get_list_items(fields, "depends_on"):
             target, err = check_depends_on_item(item)
@@ -265,15 +284,30 @@ def check_notes(root: Path, note_index: dict[str, list[Path]]):
                     (rel, f"depends_on target does not resolve to an existing note: {target!r}")
                 )
 
-        if p.parent.name == "ideas" or str(p.relative_to(root)).startswith("ideas" + "/"):
-            has_link = bool(WIKILINK_ANY_RE.search(body))
-            has_marker = "no genuine relation" in body.lower()
-            if not has_link and not has_marker:
-                warnings.append(
-                    (rel, 'zero outgoing [[wikilinks]] and no "no genuine relation found" marker')
-                )
+        # Connect step applies to every note, wherever it lives - folders don't
+        # distinguish "idea" from "capture" anymore.
+        has_link = bool(WIKILINK_ANY_RE.search(body))
+        has_marker = "no genuine relation" in body.lower()
+        if not has_link and not has_marker:
+            warnings.append(
+                (rel, 'zero outgoing [[wikilinks]] and no "no genuine relation found" marker')
+            )
 
     return errors, warnings
+
+
+# --------------------------------------------------------------------------
+# --enrich-list: notes missing the floor schema, for the automatic enrichment
+# obligation in idea-notes.mdc (no pass/fail - a report, not a gate)
+# --------------------------------------------------------------------------
+
+def enrich_list(root: Path) -> list[str]:
+    missing: list[str] = []
+    for p in iter_note_files(root):
+        _, _, _, _, title, state_present, state_val = read_floor_schema(p)
+        if not title or not state_present or state_val not in VALID_STATES:
+            missing.append(str(p.relative_to(root)))
+    return missing
 
 
 # --------------------------------------------------------------------------
@@ -425,12 +459,18 @@ def check_file_sizes(root: Path):
 def main() -> int:
     argv = sys.argv[1:]
     quiet = "--quiet" in argv
+    do_enrich_list = "--enrich-list" in argv
     positional = [a for a in argv if not a.startswith("--")]
     root = Path(positional[0]).resolve() if positional else DEFAULT_ROOT
 
     if not root.is_dir():
         print(f"vault root not found: {root}", file=sys.stderr)
         return 2
+
+    if do_enrich_list:
+        for rel in enrich_list(root):
+            print(rel)
+        return 0
 
     note_index = build_note_index(root)
     note_errors, note_warnings = check_notes(root, note_index)

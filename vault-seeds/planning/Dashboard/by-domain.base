@@ -1,0 +1,65 @@
+# by-domain.base — ideas grouped/filtered by `domains`.
+# `domains` is multi-valued and overlap can SPAN projects (e.g. `auth` work that
+# touches both quantsoc and gateway). Grouping by domain surfaces cross-project
+# themes that the by-project view can't.
+
+# FOLDERS CARRY ZERO SEMANTICS in this vault (idea-notes.mdc) — scope by
+# property: any note that declares at least one domain, wherever it lives.
+filters:
+  and:
+    - 'file.ext == "md"'
+    - '!domains.isEmpty()'
+
+properties:
+  state:
+    displayName: "State"
+  horizon:
+    displayName: "Horizon"
+  area:
+    displayName: "Area"
+  projects:
+    displayName: "Projects"
+  domains:
+    displayName: "Domains"
+  file.name:
+    displayName: "Idea"
+
+views:
+  # Every idea, grouped by domain. Multi-valued: an idea in [ui, platform] shows
+  # under both "ui" and "platform" groups.
+  - type: table
+    name: "By domain"
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
+      - projects
+    groupBy:
+      property: domains
+      direction: ASC
+
+  # Single-domain drill-down. Edit "ui" to the domain you care about, or duplicate.
+  - type: table
+    name: "ui"
+    filters:
+      and:
+        - 'domains.contains("ui")'
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
+      - projects
+
+  # Cards layout for a domain — good for a visual theme review.
+  - type: cards
+    name: "Domain cards"
+    order:
+      - file.name
+      - state
+      - projects
+      - domains
+    groupBy:
+      property: domains
+      direction: ASC

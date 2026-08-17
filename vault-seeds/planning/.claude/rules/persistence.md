@@ -1,5 +1,5 @@
 ---
-paths: ideas/**/*.md,inbox/**/*.md,archive/**/*.md,Dashboard/**/*.md,_templates/**/*.md
+paths: **/*.md
 ---
 
 # Persistence: main is the delivery surface
@@ -17,7 +17,10 @@ the session's container is reclaimed with it.
   merges the way Obsidian Sync merges; a genuine collision surfaces as a
   "(conflicted copy ...)" note on the owner's devices, never as lost data - git
   history keeps every side.
-- **Pull before writing, push after.** A fresh pull avoids needless conflicted copies.
+- **Pull before writing, push after.** A fresh pull avoids needless conflicted copies. When
+  another agent's write lands between your pull and your push, `concurrency.mdc` governs
+  the write cycle, merge resolution, and the git verbs that must never run here - this rule
+  states the default posture (push in the same turn), that one states how to do it safely.
 
 SCOPE: this rule governs THE VAULT REPO ONLY. It never applies to any software
 repository attached to the same session - those repos' own branch-protection and PR

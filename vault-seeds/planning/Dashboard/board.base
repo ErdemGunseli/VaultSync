@@ -1,0 +1,77 @@
+# board.base — the drag-to-change-status board.
+#
+# HOW THIS BECOMES A KANBAN:
+# Bases' own built-in view types are table | cards | list | map — there is no native
+# `board`/`kanban` type yet. The drag board comes from a community plugin that
+# registers an EXTRA view type over a Base:
+#   - "Base Board"  (github.com/mderazon/obsidian-base-board)  ← recommended
+#   - or "Kanban Bases View" / "Better Kanban Bases View"
+# With one of those installed, open this base and switch the view to the Kanban/Board
+# type; it reads `groupBy` to build columns and writes the grouped property back to
+# frontmatter when you drag a card between columns. See SETUP.md.
+#
+# The `kanban`/`board` view block below is what Base Board consumes. If you have NOT
+# installed a board plugin yet, Obsidian will fall back to / ignore the unknown type
+# and you can still use the `table (fallback)` view — so this file is safe either way.
+
+# FOLDERS CARRY ZERO SEMANTICS in this vault (idea-notes.mdc) — scope by
+# property, not location: a note is board-worthy once it has a state at all
+# (the floor schema is complete), wherever it lives.
+filters:
+  and:
+    - 'file.ext == "md"'
+    - '!state.isEmpty()'
+
+properties:
+  state:
+    displayName: "State"
+  horizon:
+    displayName: "Horizon"
+  area:
+    displayName: "Area"
+  projects:
+    displayName: "Projects"
+  file.name:
+    displayName: "Idea"
+
+views:
+  # --- Status board: columns = state, dragging a card rewrites `state`. ---
+  # `type: board` is the Base Board plugin's view type. (UNVERIFIED exact type name:
+  # the plugin may label it `kanban` instead of `board` — if columns don't render,
+  # open the view switcher and pick the board/kanban view the plugin added, which
+  # will rewrite this `type` for you. The load-bearing key is `groupBy`.)
+  - type: board
+    name: "Status board"
+    groupBy:
+      property: state
+      direction: ASC
+    order:
+      - file.name
+      - horizon
+      - area
+      - projects
+
+  # --- Horizon board: columns = Now/Next/Later/Someday/Inbox; drag to re-prioritise. ---
+  - type: board
+    name: "Horizon board"
+    groupBy:
+      property: horizon
+      direction: ASC
+    order:
+      - file.name
+      - state
+      - area
+      - projects
+
+  # --- Guaranteed-to-work fallback if no board plugin is installed: a grouped table. ---
+  - type: table
+    name: "table (fallback)"
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
+      - projects
+    groupBy:
+      property: state
+      direction: ASC

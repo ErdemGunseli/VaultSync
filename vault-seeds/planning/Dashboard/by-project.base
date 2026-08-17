@@ -1,0 +1,73 @@
+# by-project.base — ideas grouped/filtered by `projects`.
+# `projects` is a multi-valued list, so use `.contains("<project>")` to filter and
+# `groupBy: projects` to see the whole portfolio split by project.
+#
+# To make an A+B (scope-economy) view, duplicate the "Single project" view and use
+#   and: [ projects.contains("quantsoc"), projects.contains("gateway") ]
+# An idea tagged with BOTH projects shows up there — exactly the cross-project
+# overlap /next looks for ("you just built X in A — promote it to B while warm").
+
+# FOLDERS CARRY ZERO SEMANTICS in this vault (idea-notes.mdc) — scope by
+# property: any note that declares at least one project, wherever it lives
+# (skip notes with no `projects:` set - untagged captures, not this view's job).
+filters:
+  and:
+    - 'file.ext == "md"'
+    - '!projects.isEmpty()'
+
+properties:
+  state:
+    displayName: "State"
+  horizon:
+    displayName: "Horizon"
+  area:
+    displayName: "Area"
+  projects:
+    displayName: "Projects"
+  domains:
+    displayName: "Domains"
+  file.name:
+    displayName: "Idea"
+
+views:
+  # The portfolio split: every idea, grouped by project. An idea in two projects
+  # appears under both groups (Bases lists multi-valued group keys in each group).
+  - type: table
+    name: "By project"
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
+      - domains
+    groupBy:
+      property: projects
+      direction: ASC
+
+  # Single-project drill-down. EDIT the literal "quantsoc" to your project, or just
+  # duplicate this view per project. (Bases has no per-open parameter yet, so the
+  # project name is hard-coded in the saved view — this is a known Bases limitation.)
+  - type: table
+    name: "quantsoc"
+    filters:
+      and:
+        - 'projects.contains("quantsoc")'
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
+      - domains
+
+  # A+B scope-economy view: ideas that span BOTH quantsoc and gateway.
+  - type: table
+    name: "quantsoc + gateway (A+B)"
+    filters:
+      and:
+        - 'projects.contains("quantsoc")'
+        - 'projects.contains("gateway")'
+    order:
+      - file.name
+      - state
+      - horizon
+      - domains

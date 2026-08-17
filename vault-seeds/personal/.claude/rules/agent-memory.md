@@ -21,10 +21,10 @@ areas; curated, in-place-edited, small.
 ## Cold start
 
 Read `.agent-memory/INDEX.md` first, always. It's a routing table: area slug, routing keys,
-memory file path, updated date. A routing key is a path glob only where the vault actually
-files by taxonomy — this vault files ideas flat and overlaps by tag, so `ideas/**` matches
-every area and discriminates nothing. There, keys are the corpus's own `projects`/`domains`
-values and topic words; at least one key per row must genuinely discriminate. Skim
+memory file path, updated date. A routing key is a path glob only where a vault actually
+files by taxonomy — this vault's folders carry zero semantics (`idea-notes.mdc`), so no
+path glob discriminates anything here. Keys are the corpus's own `projects`/`domains` values
+and topic words instead; at least one key per row must genuinely discriminate. Skim
 `GLOBAL.md` too — small by construction.
 
 No row matches? `rg` across `.agent-memory/**` for the topic before concluding nothing is
@@ -73,8 +73,8 @@ flags, coverage lists and standing agent preferences fail #2 and never leave
 
 - Concerns **one** note → append it there under a `## Decisions` heading, dated, marked
   `(decided with owner, YYYY-MM-DD)` when the choice was the owner's.
-- Concerns **two or more** → its own note in `inbox/`, `type: decision`, `state: done`,
-  tagged `#agent/decision`, linking each note it decided.
+- Concerns **two or more** → its own note (wherever created; the location doesn't matter),
+  `type: decision`, `state: done`, tagged `#agent/decision`, linking each note it decided.
 
 **Single source.** Memory never holds a second authoritative copy of a fact that belongs in
 a note; a one-line dated echo beside the link is fine, but the note wins on disagreement.
@@ -118,4 +118,5 @@ it — an unread episodic log is a discard, not memory.
 ## Governance
 
 Ordinary reads and writes under `.agent-memory/**` need no ratification. Changing this rule
-follows the vault's baseline governance — an agent proposes in `inbox/`, the owner ratifies.
+follows the vault's baseline governance — an agent proposes via a `#agent/proposal`-tagged
+note, the owner ratifies.

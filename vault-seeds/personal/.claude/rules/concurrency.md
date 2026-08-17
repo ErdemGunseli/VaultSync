@@ -27,9 +27,9 @@ alone.
 7. After any merge, re-read every file you touched before pushing — git merges text, not
    meaning; two agents adding the same fact differently merges clean and leaves it wrong.
    That fix is part of your merge, not a later chore.
-8. Rejected three times → stop retrying. Put the content in a **new** `inbox/` note and
-   push that instead — a new path can't collide, and nothing is stranded when the
-   container is reclaimed. Say so in chat.
+8. Rejected three times → stop retrying. Put the content in a **new** note (anywhere; the
+   location doesn't matter) and push that instead — a new path can't collide, and nothing is
+   stranded when the container is reclaimed. Say so in chat.
 
 **Never declare a claim** — no lock file, no "editing X" marker. A push already is the
 compare-and-swap; a claim is a weaker copy of it plus a stale-lock failure mode git doesn't
@@ -43,8 +43,13 @@ reaches the owner's phone within seconds.
   retry the targeted edit, never force it through with a rewrite.
 - **Never reformat for content** — no re-wrapping, re-ordering, "while I'm here". Reflow
   manufactures conflicts out of edits that would have merged untouched.
-- **Never delete a note** unless asked this session; emptying one is deleting it. Superseded
-  content moves to `archive/` with a link back.
+- **Never delete a note** unless asked this session; emptying one is deleting it. **Never
+  move or rename a note as bookkeeping** — folders carry no semantics here
+  (`idea-notes.mdc`), so enrichment and a state change happen in place. Superseded content
+  is marked `state: done` or `state: dropped` in place, with the dated `## Decisions` entry
+  and a `[[wikilink]]` to whatever superseded it. A move/rename is still legal when the user
+  asks, clearly implies it, or a genuine reorganisation needs it — never as a side effect of
+  any other task.
 - **Renames are their own commit** — fix inbound `[[wikilink]]`s in the same commit, push
   alone. git merges a rename cleanly; the cost is links nothing rewrites.
 - **Frontmatter: one key at a time, block-style lists.** Block `tags:` collides as two
@@ -69,8 +74,8 @@ Frontmatter is the one exception, only for the keys named here.
 | `updated:` or any timestamp | The later value |
 | `state:` | Further-along value (`not-started` < `started` < `done`) |
 | `tags:`/`projects:`/`domains:`/`depends_on:` | Union: existing order, then new |
-| Any other frontmatter scalar | Keep published; `inbox/` note with both values + both SHAs |
-| Delete vs. edit | Keep the file (git already left it); `inbox/` note recording the deletion |
+| Any other frontmatter scalar | Keep published; a new note with both values + both SHAs |
+| Delete vs. edit | Keep the file (git already left it); a new note recording the deletion |
 | Same lines, both substantive prose | Conflicted copy |
 | Attachment or binary | Conflicted copy; never merge bytes |
 | Dotfolder file, not covered above | Stop, report in chat |
@@ -87,7 +92,7 @@ In a pull-merge `:2:` is your side, `--theirs` is `origin/main`. Never make the 
 dotfolder — Sync doesn't traverse them, so it's visible to agents and no device; route that
 collision to "stop, report" instead.
 
-**Small and specific goes to `inbox/` instead.** A conflicted copy freezes the note for
+**Small and specific goes into a new note instead.** A conflicted copy freezes the note for
 every agent until a human reconciles it — spend one only when both full versions genuinely
 need to sit side by side. Never touch a note that already has one: per the constitution,
 that's the owner's.

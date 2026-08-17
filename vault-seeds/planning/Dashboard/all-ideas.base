@@ -1,0 +1,119 @@
+# all-ideas.base — the master corpus view.
+# Bases is a CORE plugin (Obsidian 1.9+). Open this file to get an interactive,
+# inline-editable table/cards view in Live Preview. Cell edits write straight back
+# to each note's frontmatter.
+#
+# SYNTAX NOTE (verified June 2026 against the kepano/obsidian-skills Bases skill and
+# the Meta Bind 1.5.x example vault): a .base file is YAML with top-level keys
+# `filters`, `formulas`, `properties`, `views`. Views take `type` (table|cards|list|map),
+# `name`, `order` (columns), `filters`, `groupBy` ({property, direction}), `sort`, `limit`.
+# Property refs: bare names = note frontmatter (e.g. `state`); `file.*` = file props
+# (file.name, file.folder, file.tags, file.mtime); `formula.*` = formulas below.
+# List emptiness is tested with `.isEmpty()` (e.g. `depends_on.isEmpty()`).
+#
+# FOLDERS CARRY ZERO SEMANTICS in this vault (idea-notes.mdc) — a note can be
+# created anywhere, and enrichment/state changes never move it as bookkeeping.
+# So this base does NOT filter by file.inFolder("ideas"/"inbox"/"archive"): it
+# scopes to every markdown file except Dashboard/ and _templates/ (views/docs
+# and templates, not notes) and README.md files (vault documentation, not
+# notes) — the same exclusion validate-notes.py uses. "State" is a property,
+# never a location.
+filters:
+  and:
+    - 'file.ext == "md"'
+    - '!file.inFolder("Dashboard")'
+    - '!file.inFolder("_templates")'
+    - 'file.name != "README"'
+
+formulas:
+  # True when the idea has no declared hard dependencies (a launch-ready signal).
+  # NOTE: this only checks that the list is empty, not that deps are *done*
+  # (Bases cannot follow links to other notes' state); see next.base for the caveat.
+  deps_clear: 'if(depends_on.isEmpty(), "✓ clear", "⛓ blocked")'
+
+properties:
+  state:
+    displayName: "State"
+  horizon:
+    displayName: "Horizon"
+  area:
+    displayName: "Area"
+  projects:
+    displayName: "Projects"
+  domains:
+    displayName: "Domains"
+  depends_on:
+    displayName: "Depends on"
+  formula.deps_clear:
+    displayName: "Deps"
+  file.name:
+    displayName: "Idea"
+
+views:
+  # Primary editable table. Click any state/horizon/area cell to edit inline.
+  - type: table
+    name: "All ideas"
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
+      - projects
+      - domains
+      - formula.deps_clear
+    sort:
+      - property: state
+        direction: ASC
+      - property: horizon
+        direction: ASC
+
+  # Card gallery — nicer for skimming a large corpus.
+  - type: cards
+    name: "Cards"
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
+      - projects
+
+  # Compact list, grouped by horizon (Now/Next/Later/Someday/Inbox).
+  - type: list
+    name: "By horizon"
+    order:
+      - file.name
+      - state
+      - area
+    groupBy:
+      property: horizon
+      direction: ASC
+
+  # Missing metadata: notes the floor schema isn't complete on yet — the
+  # detectable "needs enrichment" state (idea-notes.mdc). Property-driven, not
+  # folder-driven: a note anywhere can show up here, and leaves once enriched.
+  - type: table
+    name: "Needs metadata"
+    filters:
+      or:
+        - 'state.isEmpty()'
+        - 'title.isEmpty()'
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
+      - projects
+      - domains
+
+  # Pending rule-change proposals — the one place to see them all, tag-based
+  # per vault-constitution.mdc (folders don't file proposals here any more).
+  - type: table
+    name: "Proposals"
+    filters:
+      and:
+        - 'tags.contains("agent/proposal")'
+    order:
+      - file.name
+      - state
+      - horizon
+      - area
