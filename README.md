@@ -221,15 +221,25 @@ burst of continuous writes debounces into one commit, and that a file over the S
 withheld and warned about while its siblings still sync. Nothing greps the source, so a rename
 cannot fake a pass and inverted logic cannot slip through.
 
+Conflict resolution is tested against a **hand-built conflicted index**, both directions of a
+modify/delete, rather than by racing the daemon: a timing-based version of that test silently
+stopped constructing the conflict and passed against known-broken code. If a test here cannot
+be shown to fail against the bug it names, it is not yet a test.
+
+One environment note worth keeping: the suites isolate git with an empty temp file, **not**
+`/dev/null` — git >=2.43 parses a config path as a real file and fails with
+`bad config line 1 in file /dev/null`, which silently turned every git-touching assertion red
+for reasons that had nothing to do with the daemon.
+
 ---
 
 ## Status
 
 | Component | State |
 |---|---|
-| **Sync daemon** | Built, tested (38/38), validated against `obsidian-headless` 0.0.14 |
-| **Agent access skill** | Designed, specified in [`docs/`](docs/), not yet built |
-| **Live deployment** | Not yet — needs a vault repo and credentials |
+| **Sync daemon** | Built, tested (74/74), validated against `obsidian-headless` 0.0.14 |
+| **Agent access skill** | Built and cold-start verified (the `vault` skill, in the consuming repo) |
+| **Live deployment** | Live — two vaults bridged end to end |
 
 The daemon pins `obsidian-headless` by version on purpose. It is a `0.0.x` open beta whose
 CLI has already changed shape between releases; three separate bugs in an earlier
