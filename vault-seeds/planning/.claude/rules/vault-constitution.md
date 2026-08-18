@@ -77,8 +77,7 @@ The full statement of this boundary lives in the factory rule `planning-vault-bo
 and is deliberately NOT restated here: two maintained copies in two repos would drift,
 which is precisely what the boundary forbids. What is vault-specific and binding here:
 `.agent-memory/` is agent bookkeeping about this vault's content and belongs in this
-vault (see the agent-memory rule), and a note that arrives from a repo carries its
-approval marker with it rather than relying on anyone's memory of a chat.
+vault (see the agent-memory rule).
 
 ## Scope of authority: this vault, and nothing it points at
 
