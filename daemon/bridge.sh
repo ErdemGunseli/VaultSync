@@ -64,6 +64,28 @@
 #                                     files over 5MB, so pushing one via git
 #                                     would never reach devices). 0 disables.
 #                                     (default 5)
+#   VAULT_MAX_DELETE_PCT              a pass deleting at least this % of tracked
+#                                     files is REFUSED, not committed (default
+#                                     50; 0 disables). Guards against anything
+#                                     that empties the working tree being
+#                                     propagated to every device.
+#   VAULT_MIN_DELETE_FLOOR            deletions below this count are never
+#                                     refused, whatever the percentage
+#                                     (default 10) - ordinary tidying in a small
+#                                     vault must not trip the guard.
+#   VAULT_DELETE_GRACE_SECS           a held deletion proceeds after this long if
+#                                     still present (default 600). The guard
+#                                     delays a catastrophe; it must never strand
+#                                     an owner who meant it.
+#   VAULT_OB_TIMEOUT                  seconds bounding each `ob` call (default
+#                                     300 - generous enough for a large vault's
+#                                     first link, which happens once). A stall would otherwise hang the
+#                                     bridge before the reconcile loop, and the
+#                                     supervisor only restarts a child that EXITS.
+#   VAULT_HEARTBEAT_SECS              seconds between heartbeat log lines
+#                                     (default 900; 0 disables). A successful
+#                                     pass is otherwise silent, so this is how
+#                                     git-level liveness is confirmed from logs.
 #   VAULT_SYNC_REMOTE                 Obsidian Sync remote vault name or id
 #   VAULT_SYNC_ENCRYPTION_PASSWORD    E2E encryption password (REQUIRED if the
 #                                     remote vault is encrypted - omitting it
@@ -116,7 +138,7 @@ log() { printf '[vault-bridge:%s] %s\n' "$NAME" "$*" >&2; }
 # bridge before it ever reached the reconcile loop - and supervise() restarts a
 # vault only when its child EXITS, so a hang meant that vault silently stopped
 # syncing for the life of the container with nothing in the log to say so.
-OB_TIMEOUT="${VAULT_OB_TIMEOUT:-120}"
+OB_TIMEOUT="${VAULT_OB_TIMEOUT:-300}"
 ob_q() { timeout "$OB_TIMEOUT" ob "$@" </dev/null >/dev/null 2>&1; }
 ob_v() { timeout "$OB_TIMEOUT" ob "$@" </dev/null; }
 
@@ -187,6 +209,11 @@ fi
 # interrupted mid-write leaves one behind, and treating it as "already cloned"
 # produced a silent zombie - every later git command failed while the only log
 # line was a benign-looking "push failed" once per poll, forever. Ask git.
+# A persistent volume can carry files owned by a different UID than this process
+# (restore, migration, a future non-root USER). Git then refuses the repo for
+# "dubious ownership" - benign, and NOT corruption. Declare it safe before the
+# validity check so the FATAL below cannot fire on a perfectly healthy repo.
+git config --global --add safe.directory "$VAULT_DIR" >/dev/null 2>&1 || true
 if [ -d "$VAULT_DIR/.git" ] && ! git -C "$VAULT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   log "FATAL: $VAULT_DIR/.git exists but is not a usable git repository"
   log "       (an interrupted clone leaves this behind). Refusing to run against it:"
@@ -424,6 +451,9 @@ enforce_size_cap() {
 # from a clone, which the daemon will happily fast-forward.
 MAX_DELETE_PCT="${VAULT_MAX_DELETE_PCT:-50}"
 MIN_DELETE_FLOOR="${VAULT_MIN_DELETE_FLOOR:-10}"
+DELETE_GRACE_SECS="${VAULT_DELETE_GRACE_SECS:-600}"
+DELETE_HOLD_SINCE=0
+DELETE_HOLD_SIG=""
 guard_mass_deletion() {
   [ "$MAX_DELETE_PCT" -gt 0 ] || return 0
   local deleted tracked pct
@@ -433,12 +463,31 @@ guard_mass_deletion() {
   [ "$tracked" -gt 0 ] || return 0
   pct=$(( deleted * 100 / tracked ))
   [ "$pct" -ge "$MAX_DELETE_PCT" ] || return 0
-  log "REFUSING TO COMMIT: this pass would delete ${deleted} of ${tracked} tracked files (${pct}%)."
-  log "         Nothing has been committed or pushed, and nothing in git is lost."
-  log "         The working tree is left exactly as it is - inspect $VAULT_DIR."
-  log "         If the deletion is intended: set VAULT_MAX_DELETE_PCT higher (or 0"
-  log "         to disable this guard) and redeploy, or delete via a normal commit"
-  log "         from a clone, which syncs without tripping this."
+  # Hold, then proceed. A mass deletion that is REAL (the owner reorganising)
+  # persists; the failure modes this guards against (a bad first-link
+  # reconciliation, a half-mounted volume, a transient emptied tree) resolve or
+  # get noticed inside the grace window. So refuse loudly at first sight and
+  # keep refusing while it is fresh, then let it through rather than leaving a
+  # vault permanently stuck for someone with no way to override it.
+  local now_del
+  now_del="$(date +%s)"
+  if [ "$DELETE_HOLD_SINCE" -eq 0 ] || [ "$DELETE_HOLD_SIG" != "$deleted/$tracked" ]; then
+    DELETE_HOLD_SINCE="$now_del"
+    DELETE_HOLD_SIG="$deleted/$tracked"
+  fi
+  local held=$(( now_del - DELETE_HOLD_SINCE ))
+  if [ "$held" -ge "$DELETE_GRACE_SECS" ]; then
+    log "PROCEEDING with the large deletion (${deleted}/${tracked}, ${pct}%) after ${held}s:"
+    log "         it persisted through the grace window, so it reads as intended."
+    log "         Every deleted file remains recoverable from git history."
+    DELETE_HOLD_SINCE=0
+    DELETE_HOLD_SIG=""
+    return 0
+  fi
+  log "HOLDING a large deletion: ${deleted} of ${tracked} tracked files (${pct}%)."
+  log "         Nothing committed or pushed yet, and nothing in git is lost."
+  log "         If this was NOT intended, restore the files in $VAULT_DIR now -"
+  log "         otherwise it proceeds automatically in $(( DELETE_GRACE_SECS - held ))s."
   return 1
 }
 
@@ -519,6 +568,10 @@ EOF
 
 # Sets RECONCILE_ACTIVITY=1 iff this pass actually moved something (a remote
 # commit landed, or a local commit was made) - used to drive the adaptive poll.
+HEARTBEAT_SECS="${VAULT_HEARTBEAT_SECS:-900}"
+COMMIT_FAIL_COUNT=0
+LAST_HEARTBEAT=0
+
 RECONCILE_ACTIVITY=0
 reconcile_pass() {
   RECONCILE_ACTIVITY=0
@@ -544,7 +597,13 @@ reconcile_pass() {
         # Every other failure in this loop logs; this one used to be silent, so a
         # full disk (the likeliest cause, and one a sibling vault can inflict on
         # a shared volume) looked exactly like a healthy idle daemon.
-        log "WARNING: commit failed - changes remain uncommitted (disk full? index lock?)."
+        # Log the first failure, then rarely: this fires once per poll while the
+        # underlying condition lasts, and unbounded spam buries the message that
+        # matters.
+        COMMIT_FAIL_COUNT=$(( COMMIT_FAIL_COUNT + 1 ))
+        if [ "$COMMIT_FAIL_COUNT" -eq 1 ] || [ $(( COMMIT_FAIL_COUNT % 60 )) -eq 0 ]; then
+          log "WARNING: commit failed (x${COMMIT_FAIL_COUNT}) - changes remain uncommitted (disk full? index lock?)."
+        fi
       fi
     fi
   fi
@@ -618,6 +677,21 @@ while true; do
       log "WARNING: ob sync exited - restarting"
       start_ob_continuous
       OB_RESTART_AFTER=$(( now_ts + 5 ))
+    fi
+  fi
+
+  # Heartbeat. Every pass is silent on success by design (only WARNING/FATAL/
+  # CONFLICT log), which means an operator reading logs cannot tell a healthy
+  # quiet daemon from a wedged one - a review hit exactly that wall. This prints
+  # one line per HEARTBEAT_SECS with the git-level state, so liveness is
+  # answerable from logs alone. 0 disables.
+  if [ "$HEARTBEAT_SECS" -gt 0 ]; then
+    now_hb="$(date +%s)"
+    if [ $(( now_hb - LAST_HEARTBEAT )) -ge "$HEARTBEAT_SECS" ]; then
+      LAST_HEARTBEAT="$now_hb"
+      hb_head="$(git -C "$VAULT_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
+      hb_dirty="$(git -C "$VAULT_DIR" status --porcelain 2>/dev/null | wc -l)"
+      log "heartbeat: HEAD=$hb_head uncommitted=$hb_dirty poll=${CURRENT_INTERVAL}s ob=${HAVE_OB}"
     fi
   fi
 

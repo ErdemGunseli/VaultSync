@@ -105,6 +105,14 @@ polling is adaptive: quick while there's been recent activity, backing off towar
 otherwise. If `inotify-tools` is ever missing at runtime, the daemon falls back to
 interval-only polling with a WARNING rather than losing local-edit detection silently.
 
+**Never propagate a vault-emptying commit.** Anything that empties the working tree — a bad
+first-link reconciliation, a half-mounted volume, a stray `rm` — was previously staged,
+committed and pushed within one poll, and from there to every device. A pass that would
+delete most of the vault is now *held*, loudly, and proceeds only if it is still there
+after a grace window (a real reorganisation persists; a glitch does not). Git history keeps
+every side either way, and the guard is tuned so it delays a catastrophe without ever
+stranding an owner who meant it.
+
 **Never commit past the Sync cap.** Obsidian Sync (Standard plan) refuses files over 5MB. A
 file that size committed via git would reach the repo but never reach a device — silent
 divergence. The daemon refuses to commit an oversize file (unstaging it, not deleting it) and

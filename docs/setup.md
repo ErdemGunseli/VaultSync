@@ -29,7 +29,7 @@ else.** If you are an agent reading this, "everything else" is yours.
 
 1. Push a seed tree (`vault-seeds/` here) into the new repo as its first commit -
    this ships the baseline: `.gitignore`, LFS patterns, the vault constitution,
-   the persistence rule (changes push to main in the same turn), the `borrow`
+   the persistence rule (changes push to main in the same turn), the `use`
    skill, and `.agent-memory/`.
 2. Stage the env group: `VAULT_n` = repo URL (the identity), `VAULT_n_SYNC_REMOTE`
    = the Sync remote's exact name, placeholders for the secrets. One group defines
