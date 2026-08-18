@@ -84,5 +84,40 @@ check "case C: resolver succeeds for a dotted directory with an extensionless fi
 copies=$(find "$TMP/c" -name "*conflicted copy*" -not -path "*/.git/*" | wc -l)
 check "case C: conflicted copy landed in the right directory" "1" "$copies"
 
+# --- Case D: the size cap must apply to the conflicted copy too --------------
+# A conflicted copy is a NEW blob written by the resolver and committed by it.
+# The cap ran only on the ordinary commit path, so an oversized losing side
+# reached git and could never reach a device - the exact divergence the cap
+# exists to stop, through the one path that skipped it. Mutation-tested: delete
+# the enforce_size_cap call in the resolver and this case fails.
+{
+  echo 'log() { printf "[test] %s\n" "$*"; }'
+  echo 'MAX_FILE_MB="${VAULT_MAX_FILE_MB:-5}"'
+  awk '/^enforce_size_cap\(\)/,/^}$/' "$BRIDGE"
+  awk '/^resolve_conflicts_sync_style\(\)/,/^}$/' "$BRIDGE"
+} > "$TMP/resolver_cap.sh"
+
+# Built from scratch: calling make_conflict first would leave the tree already
+# conflicted, so the follow-up checkout fails and NO conflict gets constructed -
+# the assertion then passes without testing anything (observed, then fixed).
+( rm -rf "$TMP/d"; mkdir -p "$TMP/d"; cd "$TMP/d"
+  git init -q .; git config user.email t@t.invalid; git config user.name t
+  printf 'original\n' > big.md; git add -A; git commit -qm base
+  git branch -q other
+  git rm -q big.md; git commit -qm "ours: delete"
+  git checkout -q other
+  head -c 2000000 /dev/zero | tr '\0' 'x' > big.md
+  git add -A; git commit -qm "theirs: oversized modify"
+  git checkout -q master 2>/dev/null || git checkout -q main
+  git merge --no-edit other >/dev/null 2>&1 ) >/dev/null 2>&1
+unmerged_d=$(git -C "$TMP/d" diff --name-only --diff-filter=U 2>/dev/null | wc -l)
+check "case D really is a conflicted state (not a vacuous pass)" "1" "$unmerged_d"
+( set +u; export VAULT_DIR="$TMP/d" VAULT_MAX_FILE_MB=1
+  . "$TMP/resolver_cap.sh"; resolve_conflicts_sync_style ) >"$TMP/d.log" 2>&1
+committed_copy=$(git -C "$TMP/d" ls-tree -r --name-only HEAD 2>/dev/null | grep -c "conflicted copy" || true)
+check "an oversized conflicted copy is NOT committed" "0" "$committed_copy"
+check "and the cap says why" "yes" \
+  "$([ "$(grep -c 'exceeds sync cap' "$TMP/d.log")" -ge 1 ] && echo yes || echo no)"
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

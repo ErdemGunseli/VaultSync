@@ -315,6 +315,65 @@ Body.
 EOF
 run_case "document vault: invalid state value still fails" "$TMP/document-vault-badstate" 1 "not one of"
 
+# 17. A folder NAMED Dashboard, nested anywhere, must NOT exempt a real note.
+# The skip is for two specific top-level directories; matching the name at any
+# depth let a note evade every check by where it sat - the exact folder-carries-
+# meaning behaviour this vault does not have.
+make_base_vault "$TMP/nested-dashboard"
+mkdir -p "$TMP/nested-dashboard/projects/sub/Dashboard"
+cat > "$TMP/nested-dashboard/projects/sub/Dashboard/sneaky.md" <<'EOF'
+---
+title: Hiding in a folder called Dashboard
+state: not-a-real-state
+---
+Body [[ideas/valid]]
+EOF
+run_case "a note under a NESTED folder named Dashboard is still checked" "$TMP/nested-dashboard" 1 "not one of"
+
+# 18. The real top-level Dashboard/ is still exempt (the skip must still work).
+make_base_vault "$TMP/root-dashboard"
+mkdir -p "$TMP/root-dashboard/Dashboard"
+cat > "$TMP/root-dashboard/Dashboard/view.md" <<'EOF'
+# A dashboard view, no frontmatter by design.
+EOF
+run_case "the real top-level Dashboard/ is still exempt" "$TMP/root-dashboard" 0
+
+# 19. Uppercase .MD is a note on macOS/Windows and was never scanned at all.
+make_base_vault "$TMP/upper-ext"
+cat > "$TMP/upper-ext/ideas/upper.MD" <<'EOF'
+---
+title: Upper case extension
+state: bogus-state
+---
+Body [[ideas/valid]]
+EOF
+run_case "an uppercase .MD note is scanned like any other" "$TMP/upper-ext" 1 "not one of"
+
+# 20. depends_on may carry Obsidian's #heading and ^block anchors; both name the
+# same note and must resolve rather than being reported unresolvable.
+make_base_vault "$TMP/anchors"
+cat > "$TMP/anchors/ideas/anchored.md" <<'EOF'
+---
+title: Anchored dependency
+state: not-started
+depends_on: ["[[ideas/valid#Some Heading]]", "[[ideas/other^abcd12]]"]
+---
+Body [[ideas/valid]]
+EOF
+run_case "depends_on accepts #heading and ^block anchors" "$TMP/anchors" 0
+
+# 21. A duplicate top-level key silently discarded the first value.
+make_base_vault "$TMP/dupkey"
+cat > "$TMP/dupkey/ideas/dup.md" <<'EOF'
+---
+title: First title
+title: Second title
+state: not-started
+---
+Body [[ideas/valid]]
+EOF
+run_case "a duplicate frontmatter key is an error, not a silent overwrite" "$TMP/dupkey" 1 "duplicate frontmatter key"
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

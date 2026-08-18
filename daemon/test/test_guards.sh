@@ -160,5 +160,44 @@ env VAULT_NAME=guards VAULT_REPO="$TMP/remote.git" VAULT_DIR="$TMP/vault2" \
 check "VAULT_HEARTBEAT_SECS=0 disables it as documented" "0" \
   "$(grep -c 'heartbeat:' "$TMP/hb0")"
 
+# --- 7. A hanging `ob` must not wedge the bridge -----------------------------
+# The supervisor only restarts a child that EXITS, so an ob call that hangs
+# stopped that vault syncing for the life of the container, silently. The
+# timeout is what prevents it - and nothing tested it, so removing the wrapper
+# would have shipped unnoticed.
+STUB="$TMP/stub"; mkdir -p "$STUB"
+printf '#!/usr/bin/env bash\nsleep 600\n' > "$STUB/ob"; chmod +x "$STUB/ob"
+rm -rf "$TMP/vault7" "$TMP/obstate7"
+env PATH="$STUB:$PATH" VAULT_NAME=guards VAULT_REPO="$TMP/remote.git" \
+    VAULT_DIR="$TMP/vault7" VAULT_BRANCH=main VAULT_BRIDGE_INTERVAL=1 \
+    VAULT_OB_TIMEOUT=2 XDG_CONFIG_HOME="$TMP/obstate7" \
+    timeout 30 bash "$BRIDGE" > "$TMP/log7" 2>&1
+check "a hanging ob does not prevent the bridge reaching its reconcile loop" "yes" \
+  "$([ "$(grep -c 'reconcile loop' "$TMP/log7")" -ge 1 ] && echo yes || echo no)"
+check "and it degrades to git-only rather than hanging" "yes" \
+  "$([ "$(grep -c 'git-only mode' "$TMP/log7")" -ge 1 ] && echo yes || echo no)"
+
+# --- 8. A failing commit is reported, not silent ----------------------------
+# This was the one operation in the loop with no failure logging, so a full disk
+# looked exactly like a healthy idle daemon.
+rm -rf "$TMP/vault8" "$TMP/obstate8"
+env VAULT_NAME=guards VAULT_REPO="$TMP/remote.git" VAULT_DIR="$TMP/vault8" \
+    VAULT_BRANCH=main VAULT_BRIDGE_INTERVAL=1 XDG_CONFIG_HOME="$TMP/obstate8" \
+    bash "$BRIDGE" > "$TMP/log8" 2>&1 &
+BRIDGE_PID=$!
+await 20 test -d "$TMP/vault8/.git"
+# Fail the COMMIT specifically. An index.lock would fail `git add` first, so the
+# commit is never attempted and this would test nothing - the failure has to
+# land on the operation whose silence was the defect.
+mkdir -p "$TMP/vault8/.git/hooks"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/vault8/.git/hooks/pre-commit"
+chmod +x "$TMP/vault8/.git/hooks/pre-commit"
+printf 'a new note\n' > "$TMP/vault8/fresh.md"
+sleep 6
+check "a failing commit logs a warning instead of failing silently" "yes" \
+  "$([ "$(grep -c 'commit failed' "$TMP/log8")" -ge 1 ] && echo yes || echo no)"
+kill $BRIDGE_PID 2>/dev/null; wait $BRIDGE_PID 2>/dev/null; BRIDGE_PID=""
+rm -f "$TMP/vault8/.git/hooks/pre-commit"
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
