@@ -11,7 +11,7 @@ else.** If you are an agent reading this, "everything else" is yours.
    (omit `--password`; the prompt keeps the passphrase out of shell history).
    Generate the passphrase with a password-manager generator (6-7 random words) and
    store it there. Never paste a passphrase into a chat.
-3. **Paste four values into the Render env group** (`vaultsync` on the hosting
+3. **Paste four values into the Render env group** (`VaultSync` on the hosting
    account), replacing the placeholders an agent has staged:
    - `OBSIDIAN_AUTH_TOKEN` - from `~/.obsidian-headless/auth_token` after `ob login`
      (macOS path; Linux: `~/.config/obsidian-headless/auth_token`). A trailing `%`

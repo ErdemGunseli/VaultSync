@@ -11,7 +11,7 @@
 # =============================================================================
 services:
   - type: worker
-    name: vault-bridge
+    name: VaultSync
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: starter          # workers have no free tier; starter is the floor

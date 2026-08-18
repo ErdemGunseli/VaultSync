@@ -71,8 +71,8 @@ source of truth, and agents reference it from here. Code repositories are the ma
 execution surface: code, records rule-bound to code (ledgers, canonical docs), and
 AI-written implementation plans, whose audience is the executing agent. A document is
 never dual-homed - one side is the source, the other at most a pointer or generated
-mirror. When an implementation plan graduates to something the owner works with as
-planning, it moves here deliberately and the repo copy becomes the pointer.
+mirror. An implementation plan moves here only when the owner asks - never by an
+agent's own judgment - and then the repo copy becomes the pointer.
 
 ## Scope of authority: this vault, and nothing it points at
 
