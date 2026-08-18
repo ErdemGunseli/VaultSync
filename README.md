@@ -87,6 +87,14 @@ appear, with your device's version kept in the main note. Pushes are *never* for
 history keeps every side of every conflict, so nothing is ever lost — the safety net is
 strictly stronger than Sync's version history.
 
+**A silent daemon must be distinguishable from a working one.** Every reconcile pass is
+quiet on success, so logs alone could not tell a healthy bridge from a wedged one. A
+periodic heartbeat prints the git-level state (`HEAD`, uncommitted count, poll rate), and
+because `ob` has no health API — a live process proves nothing about whether it is still
+syncing — the bridge watches `ob`'s own narration and reports how long it has been silent,
+warning when that passes a threshold. That last case is the one failure mode that used to
+be invisible: git syncing normally while devices quietly receive nothing.
+
 **Fail soft, and say so.** No credentials means idle, not crash. No Obsidian auth means
 git-only mode *with a warning* — agents keep syncing, phone-only edits do not, and the log
 says which. Silence is never the failure mode.

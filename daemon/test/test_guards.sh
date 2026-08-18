@@ -199,5 +199,35 @@ check "a failing commit logs a warning instead of failing silently" "yes" \
 kill $BRIDGE_PID 2>/dev/null; wait $BRIDGE_PID 2>/dev/null; BRIDGE_PID=""
 rm -f "$TMP/vault8/.git/hooks/pre-commit"
 
+# --- 9. ob alive but SILENT is detected --------------------------------------
+# The one failure the daemon could not see: `kill -0` proves only that the
+# process exists. ob narrates its own work, so tracking when it last spoke turns
+# that narration into the health signal the client offers no API for.
+TALKS="$TMP/talks"; mkdir -p "$TALKS"
+printf '#!/usr/bin/env bash\nif [ "$1" = "sync" ]; then while true; do echo "Fully synced"; sleep 1; done; fi\nexit 0\n' > "$TALKS/ob"
+chmod +x "$TALKS/ob"
+rm -rf "$TMP/vault9" "$TMP/obstate9"; mkdir -p "$TMP/obstate9"
+env PATH="$TALKS:$PATH" VAULT_NAME=guards VAULT_REPO="$TMP/remote.git" \
+    VAULT_DIR="$TMP/vault9" VAULT_BRANCH=main VAULT_BRIDGE_INTERVAL=1 \
+    VAULT_HEARTBEAT_SECS=2 VAULT_OB_SILENCE_WARN=4 XDG_CONFIG_HOME="$TMP/obstate9" \
+    timeout 12 bash "$BRIDGE" > "$TMP/log9" 2>&1
+check "a talking ob keeps ob_quiet low and raises no alarm" "0" \
+  "$(grep -c 'ob has produced no output' "$TMP/log9")"
+check "and the heartbeat reports the ob quiet time" "yes" \
+  "$(grep -m1 'heartbeat:' "$TMP/log9" | grep -q 'ob_quiet=' && echo yes || echo no)"
+
+SILENT="$TMP/silent"; mkdir -p "$SILENT"
+printf '#!/usr/bin/env bash\nif [ "$1" = "sync" ]; then sleep 600; fi\nexit 0\n' > "$SILENT/ob"
+chmod +x "$SILENT/ob"
+rm -rf "$TMP/vault10" "$TMP/obstate10"; mkdir -p "$TMP/obstate10"
+env PATH="$SILENT:$PATH" VAULT_NAME=guards VAULT_REPO="$TMP/remote.git" \
+    VAULT_DIR="$TMP/vault10" VAULT_BRANCH=main VAULT_BRIDGE_INTERVAL=1 \
+    VAULT_HEARTBEAT_SECS=2 VAULT_OB_SILENCE_WARN=4 XDG_CONFIG_HOME="$TMP/obstate10" \
+    timeout 14 bash "$BRIDGE" > "$TMP/log10" 2>&1
+check "an ob that is alive but silent IS reported" "yes" \
+  "$([ "$(grep -c 'ob has produced no output' "$TMP/log10")" -ge 1 ] && echo yes || echo no)"
+check "and the warning explains the consequence" "yes" \
+  "$([ "$(grep -c 'device edits may not be arriving' "$TMP/log10")" -ge 1 ] && echo yes || echo no)"
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

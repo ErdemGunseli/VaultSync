@@ -82,6 +82,11 @@
 #                                     first link, which happens once). A stall would otherwise hang the
 #                                     bridge before the reconcile loop, and the
 #                                     supervisor only restarts a child that EXITS.
+#   VAULT_OB_SILENCE_WARN             seconds of total `ob` silence after which
+#                                     the heartbeat warns that device sync may
+#                                     be dead despite the process being alive
+#                                     (default 5400; 0 disables). ob narrates in
+#                                     bursts, so this sits well above the gap.
 #   VAULT_HEARTBEAT_SECS              seconds between heartbeat log lines
 #                                     (default 900; 0 disables). A successful
 #                                     pass is otherwise silent, so this is how
@@ -330,11 +335,37 @@ ensure_ob_setup() {
 # situation this daemon exists to prevent. Restart-on-death happens inline in
 # the main loop (rate-limited), never via a wrapper.
 HAVE_OB=0
+# `ob sync --continuous` narrates its own work ("Connecting", "Detecting
+# changes", "Fully synced"). That stream was prefixed and discarded, which is
+# why an ob that stayed ALIVE but stopped syncing was undetectable: kill -0 only
+# proves the process exists. Stamping a marker on every line it emits turns its
+# own narration into a liveness signal - the closest thing to a heartbeat the
+# client offers, since there is no health API to ask.
+#
+# The marker lives beside the sync state, NEVER inside VAULT_DIR: a file in the
+# vault would be committed and synced to every device.
+OB_ACTIVITY_FILE="${XDG_CONFIG_HOME:-/tmp}/ob-activity-$NAME"
 start_ob_continuous() {
   log "starting: ob sync --continuous --path $VAULT_DIR"
+  touch "$OB_ACTIVITY_FILE" 2>/dev/null || true
   ob sync --continuous --path "$VAULT_DIR" </dev/null \
-    > >(sed "s/^/[ob:$NAME] /" >&2) 2>&1 &
+    > >(while IFS= read -r _ob_line; do
+          touch "$OB_ACTIVITY_FILE" 2>/dev/null || true
+          printf '[ob:%s] %s\n' "$NAME" "$_ob_line" >&2
+        done) 2>&1 &
   OB_PID=$!
+}
+
+# Seconds of total ob silence that count as "probably not syncing". ob narrates
+# in bursts with long quiet gaps between them, so this has to sit comfortably
+# above the observed gap rather than at it. 0 disables the check.
+OB_SILENCE_WARN="${VAULT_OB_SILENCE_WARN:-5400}"
+ob_silence_secs() {
+  [ -f "$OB_ACTIVITY_FILE" ] || { printf 'unknown'; return; }
+  local last now
+  last="$(stat -c %Y "$OB_ACTIVITY_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  printf '%s' "$(( now - last ))"
 }
 
 if command -v ob >/dev/null 2>&1; then
@@ -691,7 +722,16 @@ while true; do
       LAST_HEARTBEAT="$now_hb"
       hb_head="$(git -C "$VAULT_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
       hb_dirty="$(git -C "$VAULT_DIR" status --porcelain 2>/dev/null | wc -l)"
-      log "heartbeat: HEAD=$hb_head uncommitted=$hb_dirty poll=${CURRENT_INTERVAL}s ob=${HAVE_OB}"
+      hb_obq="$(ob_silence_secs)"
+      log "heartbeat: HEAD=$hb_head uncommitted=$hb_dirty poll=${CURRENT_INTERVAL}s ob=${HAVE_OB} ob_quiet=${hb_obq}s"
+      # The one failure this daemon could not see before: ob alive, git syncing,
+      # devices silently receiving nothing.
+      if [ "$HAVE_OB" -eq 1 ] && [ "$OB_SILENCE_WARN" -gt 0 ] && \
+         [ "$hb_obq" != "unknown" ] && [ "$hb_obq" -ge "$OB_SILENCE_WARN" ]; then
+        log "WARNING: ob has produced no output for ${hb_obq}s. The process is alive but may"
+        log "         not be syncing - device edits may not be arriving, and yours may not be"
+        log "         reaching devices, while git continues normally. Check the Sync remote."
+      fi
     fi
   fi
 
