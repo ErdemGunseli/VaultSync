@@ -153,5 +153,39 @@ check "the fatal message says what to fix" "yes" \
   "$([ "$(echo "$POUT" | grep -c 'REPLACE_ME placeholder')" -ge 1 ] && echo yes || echo no)"
 rm -rf "$T"
 
+# --- 11. Two repos whose basenames collide must NOT share a working dir ------
+# The name is only a local label, but it picks the working tree AND the sync
+# state key - so two vaults deriving one name would run two writers over one
+# tree and one state.db: the exact corruption this daemon exists to prevent,
+# produced by config that looks entirely valid.
+S="$(mktemp -d)"
+OUT="$(run_entry "$S" \
+  VAULT_1=https://example.invalid/orgA/notes.git \
+  VAULT_2=https://example.invalid/orgB/notes.git)"
+check "a colliding derived name launches only ONE bridge" "1" \
+  "$(echo "$OUT" | grep -c 'LAUNCHED name=notes')"
+check "the collision is reported, not silently dropped" "1" \
+  "$(echo "$OUT" | grep -c 'already used by another vault')"
+OUT="$(run_entry "$S" \
+  VAULT_1=https://example.invalid/orgA/notes.git \
+  VAULT_2=https://example.invalid/orgB/notes.git \
+  VAULT_2_NAME=notes-b)"
+check "an explicit VAULT_n_NAME resolves the collision" "2" \
+  "$(echo "$OUT" | grep -c 'LAUNCHED name=notes')"
+rm -rf "$S"
+
+# --- 12. A traversing VAULT_n_NAME cannot escape the vaults directory --------
+# VAULT_1_NAME=../ob-state would otherwise point the working tree at the shared
+# Obsidian state dir, which `git add -A` would then commit into a notes repo.
+S="$(mktemp -d)"
+OUT="$(run_entry "$S" \
+  VAULT_1=https://example.invalid/safe.git \
+  VAULT_1_NAME=../ob-state)"
+check "a traversing name is scrubbed, not used verbatim" "0" \
+  "$(echo "$OUT" | grep -c 'dir=.*\.\./ob-state')"
+check "the vault still launches under a scrubbed name" "1" \
+  "$(echo "$OUT" | grep -c 'LAUNCHED name=')"
+rm -rf "$S"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

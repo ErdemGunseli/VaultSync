@@ -81,7 +81,15 @@ def should_skip(path: Path, root: Path) -> bool:
     rel_parts = path.relative_to(root).parts
     if any(p in SKIP_DIR_NAMES for p in rel_parts):
         return True
-    if path.name.lower() in ("readme.md", "agents.md"):
+    # Root-level docs only. Scoping this matters: an unscoped name-based skip
+    # would let any note anywhere evade every check just by being called
+    # README.md, in a vault whose premise is that names and folders carry no
+    # meaning. A README.md deeper in the tree is documentation for its own
+    # folder and still skipped; AGENTS.md is generated and only valid at root.
+    rel = path.relative_to(root)
+    if path.name.lower() == "readme.md":
+        return True
+    if path.name.lower() == "agents.md" and len(rel.parts) == 1:
         return True
     return False
 

@@ -1,4 +1,5 @@
 ---
+paths: "**/*.md"
 ---
 
 # Agent memory

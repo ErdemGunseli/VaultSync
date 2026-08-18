@@ -1,4 +1,5 @@
 ---
+paths: "**/*.md"
 ---
 
 # Agent memory
@@ -22,7 +23,7 @@ areas; curated, in-place-edited, small.
 
 Read `.agent-memory/INDEX.md` first, always. It's a routing table: area slug, routing keys,
 memory file path, updated date. A routing key is a path glob only where a vault actually
-files by taxonomy — this vault's folders carry zero semantics (`idea-notes.mdc`), so no
+files by taxonomy — this vault's folders carry zero semantics, so no
 path glob discriminates anything here. Keys are the corpus's own `projects`/`domains` values
 and topic words instead; at least one key per row must genuinely discriminate. Skim
 `GLOBAL.md` too — small by construction.

@@ -122,17 +122,35 @@ derive_name() {
 }
 
 found=0
+SEEN_NAMES=" "  # space-delimited set of derived names, for collision detection
 # Indexed env-group mode: scan a bounded index space, tolerating gaps so that
 # deleting VAULT_2 never forces renumbering VAULT_3.
 for idx in $(seq 1 64); do
   rv="VAULT_${idx}"
   [ -n "${!rv:-}" ] || continue
   nv="VAULT_${idx}_NAME"
-  name="${!nv:-$(derive_name "${!rv}")}"
+  # Scrub the override through the same rule as a derived name: the name is only
+  # a local label (working dir, log prefix, state key), so an explicit
+  # VAULT_n_NAME of "../ob-state" must not escape $DATA_DIR/vaults/ and point the
+  # working tree at the auth-token store. derive_name squeezes everything outside
+  # [a-z0-9_-], so '/' and '.' cannot survive.
+  name="$(derive_name "${!nv:-$(derive_name "${!rv}")}")"
   if [ -z "$name" ]; then
     log "WARNING: VAULT_${idx} is set but no vault name could be derived - skipping."
     continue
   fi
+  # Refuse a duplicate derived name rather than collapsing two repos onto one
+  # working dir + one Sync state.db (two writers, silent corruption). The repo is
+  # the identity; two repos with a colliding basename need an explicit
+  # VAULT_n_NAME to tell them apart.
+  case "$SEEN_NAMES" in
+    *" $name "*)
+      log "FATAL: VAULT_${idx} derives the name '$name', already used by another vault."
+      log "       Two vaults sharing a local name would collapse onto one working"
+      log "       tree and one sync state - set a distinct VAULT_${idx}_NAME. Skipping."
+      continue ;;
+  esac
+  SEEN_NAMES="$SEEN_NAMES$name "
   supervise "$name" "$idx" indexed
   found=$((found + 1))
 done

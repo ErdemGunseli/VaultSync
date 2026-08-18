@@ -1,4 +1,5 @@
 ---
+paths: "**/*.md"
 ---
 
 # Concurrent agents
@@ -45,7 +46,7 @@ reaches the owner's phone within seconds.
   manufactures conflicts out of edits that would have merged untouched.
 - **Never delete a note** unless asked this session; emptying one is deleting it. **Never
   move or rename a note as bookkeeping** — folders carry no semantics here
-  (`idea-notes.mdc`), so enrichment and a state change happen in place. Superseded content
+  (folders carry zero semantics here), so enrichment and a state change happen in place. Superseded content
   is marked `state: done` or `state: dropped` in place, with the dated `## Decisions` entry
   and a `[[wikilink]]` to whatever superseded it. A move/rename is still legal when the user
   asks, clearly implies it, or a genuine reorganisation needs it — never as a side effect of

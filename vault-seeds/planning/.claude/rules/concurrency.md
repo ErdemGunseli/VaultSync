@@ -1,4 +1,5 @@
 ---
+paths: "**/*.md"
 ---
 
 # Concurrent agents

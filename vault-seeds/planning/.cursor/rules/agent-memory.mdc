@@ -1,7 +1,7 @@
 ---
 description: Two-layer agent memory under .agent-memory - bookkeeping only; durable knowledge is published to the corpus. Fact-line format, reconcile-before-write, no silent forgetting.
-globs:
-alwaysApply: true
+globs: **/*.md
+alwaysApply: false
 ---
 
 # Agent memory

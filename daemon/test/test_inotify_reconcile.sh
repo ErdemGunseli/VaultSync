@@ -10,7 +10,12 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BRIDGE="$HERE/../bridge.sh"
 PASS=0; FAIL=0
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+# Isolate from the host's git config. NOT /dev/null: git >=2.43 parses a config
+# path as a real file and errors "bad config line 1 in file /dev/null", which
+# made every git-touching assertion in this suite fail for environmental
+# reasons. An empty regular file is the portable isolation.
+GIT_ISOLATED_CONFIG="$(mktemp)"
+export GIT_CONFIG_GLOBAL="$GIT_ISOLATED_CONFIG" GIT_CONFIG_SYSTEM="$GIT_ISOLATED_CONFIG"
 
 check() {
   if [ "$2" = "$3" ]; then printf 'ok   - %s\n' "$1"; PASS=$((PASS+1))

@@ -363,7 +363,10 @@ enforce_size_cap() {
   [ "$MAX_FILE_MB" -gt 0 ] || return 0
   local max_bytes=$(( MAX_FILE_MB * 1024 * 1024 ))
   local f path size size_mb
-  git -C "$VAULT_DIR" diff --cached --name-only 2>/dev/null | while IFS= read -r f; do
+  # core.quotePath=false: a non-ASCII filename would otherwise come back
+  # git-quoted (\xxx), fail the [ -f ] test, and slip past the cap uncommitted-
+  # guard - reintroducing the silent oversize divergence this exists to stop.
+  git -C "$VAULT_DIR" -c core.quotePath=false diff --cached --name-only 2>/dev/null | while IFS= read -r f; do
     path="$VAULT_DIR/$f"
     # A deleted/renamed-away path has nothing to measure - not a cap violation.
     [ -f "$path" ] || continue
@@ -393,27 +396,52 @@ git_net() { timeout "$GIT_TIMEOUT" git -C "$VAULT_DIR" "$@"; }
 resolve_conflicts_sync_style() {
   local ts f base ext copy count=0
   ts="$(date -u '+%Y-%m-%d %H.%M.%S')"
+  local dir fn made_copy
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    case "$f" in
-      *.*) base="${f%.*}"; ext=".${f##*.}" ;;
-      *)   base="$f";      ext="" ;;
+    # Split the extension off the FILE NAME only, never the path - a note in a
+    # dot-containing directory ("my.notes/README") must not have the dot in the
+    # directory treated as the extension, which would target a nonexistent dir.
+    dir="$(dirname "$f")"; fn="$(basename "$f")"
+    case "$fn" in
+      *.*) base="${fn%.*}"; ext=".${fn##*.}" ;;
+      *)   base="$fn";      ext="" ;;
     esac
-    copy="$base (conflicted copy $ts)$ext"
+    if [ "$dir" = "." ]; then copy="$base (conflicted copy $ts)$ext"
+    else copy="$dir/$base (conflicted copy $ts)$ext"; fi
+    made_copy=0
     # stage :2 = ours (local/device), :3 = theirs (remote/agent).
     if git -C "$VAULT_DIR" cat-file -e ":3:$f" 2>/dev/null; then
       git -C "$VAULT_DIR" show ":3:$f" > "$VAULT_DIR/$copy" 2>/dev/null || return 1
+      made_copy=1
     fi
+    # Stage exactly the paths that now EXIST. Staging a pathspec that matches
+    # nothing makes `git add` fail for the whole invocation, which stages
+    # nothing at all and wedges the branch on every later pass - so each side of
+    # this decision adds only what it actually produced. Both directions of a
+    # modify/delete are covered, and each is regression-tested.
     if git -C "$VAULT_DIR" cat-file -e ":2:$f" 2>/dev/null; then
+      # We still have it: the device/local side stays in the visible note.
       git -C "$VAULT_DIR" checkout --ours -- "$f" 2>/dev/null || return 1
+      git -C "$VAULT_DIR" add -- "$f" 2>/dev/null || return 1
+      if [ "$made_copy" -eq 1 ]; then
+        git -C "$VAULT_DIR" add -- "$copy" 2>/dev/null || return 1
+        log "CONFLICT: '$f' collided - device version kept in place, other side saved as '$copy'"
+      else
+        # Theirs was a delete: nothing to save beside it, the edit simply wins.
+        log "CONFLICT: '$f' edited here, deleted on the other side - edit kept in place"
+      fi
     else
-      # We deleted it, they modified it: the modification survives as the copy,
-      # the deletion stands in the main path.
+      # We deleted it, they modified it: the deletion stands in the main path
+      # and their modification survives as the copy. The main path no longer
+      # exists, so it must NOT appear in the add - only the copy does.
       git -C "$VAULT_DIR" rm -q --cached -- "$f" 2>/dev/null || return 1
       rm -f "$VAULT_DIR/$f" 2>/dev/null
+      if [ "$made_copy" -eq 1 ]; then
+        git -C "$VAULT_DIR" add -- "$copy" 2>/dev/null || return 1
+        log "CONFLICT: '$f' deleted here, modified on the other side - their version saved as '$copy'"
+      fi
     fi
-    git -C "$VAULT_DIR" add -- "$f" "$copy" 2>/dev/null || git -C "$VAULT_DIR" add -- "$copy" 2>/dev/null || return 1
-    log "CONFLICT: '$f' collided - device version kept in place, other side saved as '$copy'"
     count=$(( count + 1 ))
   done <<EOF
 $(git -C "$VAULT_DIR" diff --name-only --diff-filter=U 2>/dev/null)
