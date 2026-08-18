@@ -19,6 +19,10 @@
 #     surfaces on every device, inside Obsidian, exactly where Sync's own
 #     conflicts appear. Never force-push; git history keeps every side of every
 #     conflict, so nothing is ever lost.
+#   - Refuse rather than corrupt: a file over the Sync cap is never committed, and
+#     a pass that would delete most of the vault is refused outright (see
+#     guard_mass_deletion) - git keeps everything, but a vault-emptying commit
+#     would otherwise reach every device within one poll.
 #   - Fail-soft: unset VAULT_REPO idles; missing/unauthenticated ob degrades to
 #     git-only with a WARNING rather than crash-looping. Missing `inotifywait`
 #     degrades to interval-only polling with a WARNING, same spirit.
@@ -107,9 +111,14 @@ MAX_FILE_MB="${VAULT_MAX_FILE_MB:-5}"
 log() { printf '[vault-bridge:%s] %s\n' "$NAME" "$*" >&2; }
 
 # `ob` must never inherit a TTY or a readable stdin: a prompt in a background
-# worker hangs forever and is invisible. Fail fast instead.
-ob_q() { ob "$@" </dev/null >/dev/null 2>&1; }
-ob_v() { ob "$@" </dev/null; }
+# worker hangs forever and is invisible. Fail fast instead. Every ob call is also
+# time-bounded. Without this a network stall in sync-setup hung the
+# bridge before it ever reached the reconcile loop - and supervise() restarts a
+# vault only when its child EXITS, so a hang meant that vault silently stopped
+# syncing for the life of the container with nothing in the log to say so.
+OB_TIMEOUT="${VAULT_OB_TIMEOUT:-120}"
+ob_q() { timeout "$OB_TIMEOUT" ob "$@" </dev/null >/dev/null 2>&1; }
+ob_v() { timeout "$OB_TIMEOUT" ob "$@" </dev/null; }
 
 INOTIFY_PID=""
 FIFO=""
@@ -174,16 +183,37 @@ if command -v git-lfs >/dev/null 2>&1; then
 fi
 
 # --- 1. Ensure the vault clone exists ----------------------------------------
+# Presence of a .git DIRECTORY is not proof of a usable repository: a clone
+# interrupted mid-write leaves one behind, and treating it as "already cloned"
+# produced a silent zombie - every later git command failed while the only log
+# line was a benign-looking "push failed" once per poll, forever. Ask git.
+if [ -d "$VAULT_DIR/.git" ] && ! git -C "$VAULT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  log "FATAL: $VAULT_DIR/.git exists but is not a usable git repository"
+  log "       (an interrupted clone leaves this behind). Refusing to run against it:"
+  log "       every operation would fail silently. Delete the directory to re-clone."
+  exit 1
+fi
 if [ ! -d "$VAULT_DIR/.git" ]; then
   log "cloning vault -> $VAULT_DIR (branch $VAULT_BRANCH)"
-  mkdir -p "$(dirname "$VAULT_DIR")" 2>/dev/null || true
-  if ! git clone --branch "$VAULT_BRANCH" "$VAULT_REPO" "$VAULT_DIR" 2>/dev/null; then
-    log "FATAL: clone failed (auth? branch? network?). Not retrying blindly."
-    log "       If this vault was JUST ADDED: does GIT_TOKEN cover this repo?"
-    log "       Fine-grained PATs list repositories explicitly - a new vault's"
-    log "       repo must be added to the token (or a new token minted)."
+  if ! mkdir -p "$(dirname "$VAULT_DIR")" 2>/dev/null; then
+    log "FATAL: cannot create $(dirname "$VAULT_DIR") - is the data disk mounted and writable?"
     exit 1
   fi
+  # Capture git's own stderr instead of discarding it. The generic guess-list
+  # below is useful, but "Remote branch main not found" or "No space left on
+  # device" is the actual answer, and it was being thrown away.
+  clone_err="$(git clone --branch "$VAULT_BRANCH" "$VAULT_REPO" "$VAULT_DIR" 2>&1 >/dev/null)" || {
+    # Never echo the URL: it carries the token. Strip anything before '@'.
+    log "FATAL: clone failed. Not retrying blindly. git said:"
+    printf '%s\n' "$clone_err" | sed 's#https://[^@]*@#https://***@#g' | while IFS= read -r l; do
+      log "       $l"
+    done
+    log "       Common causes: VAULT_BRANCH does not match the repo's default branch;"
+    log "       the repo is empty (no initial commit); GIT_TOKEN does not cover this"
+    log "       repo (fine-grained PATs list repositories explicitly, so a newly"
+    log "       added vault is never covered automatically); or the disk is full."
+    exit 1
+  }
 fi
 # A vault that declares LFS filters but has no git-lfs binary does not fail — git
 # commits the raw pointer files as if they were the media. That is silent data
@@ -379,6 +409,39 @@ enforce_size_cap() {
   done
 }
 
+# --- 4b. Mass-deletion guard: refuse to propagate a vault-emptying commit -----
+# The size cap stops a bad ADD reaching git. This is its missing counterpart for
+# a bad DELETE, and the asymmetry mattered: anything that empties the working
+# tree - a bad first-link reconciliation on the Obsidian side, a misconfigured
+# mount, an operator's stray rm, a bug - was staged, committed and PUSHED within
+# one poll cycle, and from there to every device. Git history keeps the notes, so
+# this is recoverable, but only after it has already propagated everywhere.
+#
+# "Refuse rather than corrupt" is a design law here, so a pass that would delete
+# most of the vault stops and says so instead of guessing. A genuine bulk
+# deletion is then one deliberate act: set VAULT_MAX_DELETE_PCT (or 0 to disable
+# the guard entirely) and redeploy, or make the deletion as a normal git commit
+# from a clone, which the daemon will happily fast-forward.
+MAX_DELETE_PCT="${VAULT_MAX_DELETE_PCT:-50}"
+MIN_DELETE_FLOOR="${VAULT_MIN_DELETE_FLOOR:-10}"
+guard_mass_deletion() {
+  [ "$MAX_DELETE_PCT" -gt 0 ] || return 0
+  local deleted tracked pct
+  deleted="$(git -C "$VAULT_DIR" diff --cached --name-only --diff-filter=D 2>/dev/null | wc -l)"
+  [ "$deleted" -ge "$MIN_DELETE_FLOOR" ] || return 0
+  tracked="$(git -C "$VAULT_DIR" ls-tree -r --name-only HEAD 2>/dev/null | wc -l)"
+  [ "$tracked" -gt 0 ] || return 0
+  pct=$(( deleted * 100 / tracked ))
+  [ "$pct" -ge "$MAX_DELETE_PCT" ] || return 0
+  log "REFUSING TO COMMIT: this pass would delete ${deleted} of ${tracked} tracked files (${pct}%)."
+  log "         Nothing has been committed or pushed, and nothing in git is lost."
+  log "         The working tree is left exactly as it is - inspect $VAULT_DIR."
+  log "         If the deletion is intended: set VAULT_MAX_DELETE_PCT higher (or 0"
+  log "         to disable this guard) and redeploy, or delete via a normal commit"
+  log "         from a clone, which syncs without tripping this."
+  return 1
+}
+
 # --- 5. The single reconcile pass, shared by both triggers -------------------
 # Network git operations get a hard timeout: a hung push otherwise blocks the
 # single-threaded loop indefinitely (inotify events back up in the fifo until
@@ -447,6 +510,9 @@ resolve_conflicts_sync_style() {
 $(git -C "$VAULT_DIR" diff --name-only --diff-filter=U 2>/dev/null)
 EOF
   [ "$count" -gt 0 ] || return 1
+  # Conflicted copies are staged blobs like any other: apply the same cap here,
+  # or an oversized losing side reaches git and never reaches a device.
+  enforce_size_cap
   git -C "$VAULT_DIR" commit -q --no-edit 2>/dev/null || return 1
   return 0
 }
@@ -464,9 +530,22 @@ reconcile_pass() {
   if [ -n "$(git -C "$VAULT_DIR" status --porcelain 2>/dev/null || true)" ]; then
     git -C "$VAULT_DIR" add -A 2>/dev/null || true
     enforce_size_cap
+    if ! guard_mass_deletion; then
+      # The tree lost more than the allowed share of its notes. Refuse the whole
+      # pass rather than committing it: unstage and leave the working tree
+      # untouched, so the next pass re-evaluates. Nothing is deleted from git.
+      git -C "$VAULT_DIR" reset -q 2>/dev/null || true
+      return 0
+    fi
     if ! git -C "$VAULT_DIR" diff --cached --quiet 2>/dev/null; then
-      git -C "$VAULT_DIR" commit -q -m "vault sync: $(date -u +%FT%TZ)" 2>/dev/null \
-        && RECONCILE_ACTIVITY=1
+      if git -C "$VAULT_DIR" commit -q -m "vault sync: $(date -u +%FT%TZ)" 2>/dev/null; then
+        RECONCILE_ACTIVITY=1
+      else
+        # Every other failure in this loop logs; this one used to be silent, so a
+        # full disk (the likeliest cause, and one a sibling vault can inflict on
+        # a shared volume) looked exactly like a healthy idle daemon.
+        log "WARNING: commit failed - changes remain uncommitted (disk full? index lock?)."
+      fi
     fi
   fi
 

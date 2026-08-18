@@ -3,11 +3,12 @@
 ## Components
 
 **The daemon** (`daemon/`) is the only always-on member of the Obsidian Sync mesh that also
-speaks git. It holds the Sync connection open, and every 15 seconds pulls `--ff-only` and
+speaks git. It holds the Sync connection open, and on each reconcile pass (event-driven within ~1-2s of a local edit, plus an adaptive remote poll) pulls `--ff-only` and
 commits-and-pushes whatever is dirty. It is the *entire* reason phone-to-git works.
 
-**The agent skill** (specified, not yet built) gives agents a checkout plus link-graph
-queries. See [`agent-access.md`](agent-access.md).
+**The agent skill** is built and cold-start verified: it lives in the consuming repo (the
+`vault` skill in the startup factory), not here, and gives agents a checkout plus the
+vault's own rules read as data. See [`agent-access.md`](agent-access.md).
 
 **The vault content** lives in a **separate, private** repository. This repo is machinery;
 your notes are data. Keeping them apart means the machinery can be public, versioned and
@@ -29,7 +30,7 @@ further splitting earns its keep.
 
 ## Latency and consistency
 
-Each direction is bounded by the daemon's 15-second poll plus Sync propagation — under a
+Each direction is bounded by the adaptive remote poll (VAULT_POLL_ACTIVE 2s while active, backing off to VAULT_POLL_IDLE 30s when idle) plus Sync propagation — under a
 minute in practice, both ways.
 
 The real hazard is not latency but **staleness inside a long session**: an agent's checkout
@@ -43,9 +44,10 @@ have.
 The daemon's behaviour is fully specified: pull `--ff-only`, never force-push, log every
 divergence and every Sync conflict file, and leave both for a human.
 
-**The agent side has no equivalent specification yet.** What an agent should do when it finds
-a conflicted vault is an open question this repo must answer before the skill ships. The
-default should be to stop and report, never to resolve.
+**The agent side is specified now.** An agent that finds a conflicted vault stops and
+reports: the `vault` skill's safety rails make a conflicted copy the owner's to reconcile,
+and the vault's own concurrency rule says the same. Never resolve one on the agent's own
+initiative.
 
 ## Failure modes that are silent by design
 

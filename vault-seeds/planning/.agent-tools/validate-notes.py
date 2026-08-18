@@ -59,10 +59,16 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 def is_corpus(root: Path) -> bool:
     return (root / ".cursor" / "rules" / "idea-notes.mdc").is_file()
 
-SKIP_DIR_NAMES = {
+# Dotfolders are machinery wherever they appear (a nested .git is a real
+# repository), so they are skipped at any depth.
+SKIP_DIR_ANY_DEPTH = {
     ".git", ".obsidian", ".agent-tools", ".claude", ".cursor", ".agent-memory",
-    "Dashboard", "_templates",
 }
+# These are two SPECIFIC top-level directories, not names with meaning. Skipping
+# them by name at any depth let a real note evade every check simply by sitting
+# in a folder called Dashboard - which is exactly the "a folder name changes how
+# a note is treated" behaviour this vault does not have.
+SKIP_DIR_AT_ROOT = {"Dashboard", "_templates"}
 VALID_STATES = {"not-started", "started", "done", "dropped"}
 MAX_BYTES = int(4.5 * 1024 * 1024)
 
@@ -79,7 +85,9 @@ TOP_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$")
 
 def should_skip(path: Path, root: Path) -> bool:
     rel_parts = path.relative_to(root).parts
-    if any(p in SKIP_DIR_NAMES for p in rel_parts):
+    if any(p in SKIP_DIR_ANY_DEPTH for p in rel_parts):
+        return True
+    if rel_parts and rel_parts[0] in SKIP_DIR_AT_ROOT and len(rel_parts) > 1:
         return True
     # Root-level docs only. Scoping this matters: an unscoped name-based skip
     # would let any note anywhere evade every check just by being called
@@ -140,6 +148,11 @@ def parse_frontmatter_lines(raw_lines: list[str]):
                 current = None
                 continue
             key, inline = m.group(1), m.group(2).rstrip()
+            if key in fields:
+                errors.append(
+                    f"line {lineno}: duplicate frontmatter key '{key}' - "
+                    f"the earlier value is silently discarded"
+                )
             fields[key] = {"inline": inline, "block": []}
             current = key
             if inline.lstrip().startswith("*"):
@@ -215,7 +228,11 @@ def check_depends_on_item(item: str):
     m = WIKILINK_QUOTED_RE.match(item)
     if not m:
         return None, f'depends_on entry not a quoted wikilink: {item!r} (expected "[[Note Name]]")'
-    target = m.group(2).split("|", 1)[0].strip()
+    target = m.group(2).split("|", 1)[0]
+    # Strip Obsidian's anchors: [[note#Heading]] and [[note^blockid]] both point
+    # at `note`. Only the alias form was stripped before, so a perfectly valid
+    # anchored link was reported as unresolvable.
+    target = target.split("#", 1)[0].split("^", 1)[0].strip()
     return target, None
 
 
@@ -224,7 +241,7 @@ def check_depends_on_item(item: str):
 # --------------------------------------------------------------------------
 
 def iter_note_files(root: Path):
-    for p in sorted(root.rglob("*.md")):
+    for p in sorted(q for q in root.rglob("*") if q.is_file() and q.suffix.lower() == ".md"):
         if should_skip(p, root):
             continue
         yield p
@@ -309,7 +326,13 @@ def check_notes(root: Path, note_index: dict[str, list[Path]]):
         # don't distinguish "idea" from "capture" anymore. Document vaults are
         # not under the connect obligation, so no warning noise there.
         has_link = bool(WIKILINK_ANY_RE.search(body))
-        has_marker = "no genuine relation" in body.lower()
+        low = body.lower()
+        has_marker = any(
+            phrase in low
+            for phrase in ("no genuine relation", "no genuinely related",
+                           "nothing genuinely related", "no related note",
+                           "no relevant relation")
+        )
         if corpus and not has_link and not has_marker:
             warnings.append(
                 (rel, 'zero outgoing [[wikilinks]] and no "no genuine relation found" marker')

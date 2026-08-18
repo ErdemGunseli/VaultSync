@@ -34,7 +34,7 @@ the turn that pushed it - creation is visible, never silent.
 
 ## What still needs the owner's ratification
 
-The **baseline** - the constitution, the persistence rule, the agent-memory rule, this
+The **baseline** - the persistence rule, the agent-memory rule, the concurrency rule, this
 rule, and anything governing sync, secrets, or access. Propose changes to those as a
 note tagged `#agent/proposal` - anywhere in the vault, folders carry no semantics - and
 stop; the owner ratifies. The line: agents extend the system freely, but do not amend
