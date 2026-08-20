@@ -617,6 +617,75 @@ PYEOF
   esac
 }
 
+# Force one file (or directory) out of the page cache and onto the disk.
+# `rename()` orders metadata; it does NOT promise that the bytes the new name
+# points at have been written. Without this, a crash immediately after the swap
+# can leave the destination naming a file full of zeroes - which is the same
+# data loss this whole construction exists to prevent, arriving one step later.
+#
+# Three implementations because there is no fsync builtin in shell, in
+# decreasing precision: coreutils >= 8.24 `sync FILE` syncs exactly that path
+# (this is what the container has); python3 does the same syscall directly; a
+# bare `sync` flushes the entire system, which is heavy but never wrong. Only
+# the last is a fallback in the "should not happen" sense - it still syncs.
+fsync_path() {
+  sync "$1" 2>/dev/null && return 0
+  command -v python3 >/dev/null 2>&1 && python3 -c '
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+' "$1" 2>/dev/null && return 0
+  sync 2>/dev/null || true
+}
+
+# Replace $2 with $1 so that a reader - or a crash - never sees anything but one
+# of the two whole files.
+#
+# This exists because `cat "$src" > "$dst"` does NOT: the shell truncates $dst
+# when it opens it, so from that instant until the copy finishes the only copy
+# of the destination's contents is gone. That is survivable when git holds a
+# copy; on the compression path it is not, because a file only reaches that path
+# by being OVER the size cap, which means it was refused and therefore never
+# committed. Killed mid-`cat` on a 3 MB image, 4096 bytes survived and the rest
+# was unrecoverable from anywhere. So: write beside the destination, fsync, then
+# rename(), which POSIX requires to be atomic within a single filesystem.
+#
+# What that trades, stated plainly because the comment this replaces did not:
+#
+#   - PRESERVED, and deliberately: the destination's mode and ownership, copied
+#     onto the temp before the swap. A vault file that was 0644 root:root stays
+#     0644 root:root; the old `cat` kept them for free, this does it by hand.
+#   - LOST: inode identity. rename() puts a NEW inode at the path, so the inode
+#     number changes and any pre-existing hardlink keeps pointing at the old
+#     content. Nothing here depends on either: the inotify watch is recursive
+#     over DIRECTORIES (see start_inotify_watch), so it follows the path rather
+#     than the inode and sees the rename as a normal event; git stores content,
+#     not inodes, and rewrites inodes itself on every checkout. Atomicity is
+#     worth more than an identity no reader in this system consults.
+#   - REFUSED, never silently degraded: a cross-filesystem source. `mv` across
+#     devices is a copy-then-unlink, which has exactly the truncation window
+#     this function exists to close, so the device check below fails the call
+#     instead. The caller then applies its ordinary refusal and the original
+#     file is left untouched - the safe outcome, not a corrupted one.
+replace_file_atomically() {
+  local src="$1" dst="$2" src_dev dst_dev mode
+  src_dev="$(stat -c%d "$(dirname "$src")" 2>/dev/null)" || return 1
+  dst_dev="$(stat -c%d "$(dirname "$dst")" 2>/dev/null)" || return 1
+  [ -n "$src_dev" ] && [ "$src_dev" = "$dst_dev" ] || return 1
+  mode="$(stat -c%a "$dst" 2>/dev/null)" && chmod "$mode" "$src" 2>/dev/null
+  chown --reference="$dst" "$src" 2>/dev/null || true
+  fsync_path "$src"
+  mv -f "$src" "$dst" 2>/dev/null || return 1
+  # And make the rename itself durable, not just the bytes it now points at.
+  fsync_path "$(dirname "$dst")"
+  return 0
+}
+
 # Try to bring an already-oversize image under the cap. Returns 0 ONLY when the
 # working-tree file is now genuinely under the cap and re-staged; every other
 # outcome returns non-zero so the caller applies the unchanged hard refusal.
@@ -664,8 +733,24 @@ compress_to_fit() {
   # Quality first, then progressively smaller dimensions. Stops at the FIRST
   # rung that fits, so the least destructive re-encode that works is the one
   # that ships.
-  local work tmp rung q dim dimnote new
-  work="$(mktemp -d 2>/dev/null)" || return 1
+  local work tmp rung q dim dimnote new tmp_home
+  # The re-encode is written where it will be renamed FROM, and a rename is only
+  # atomic within one filesystem - so the scratch space has to live on the
+  # vault's own volume, not in /tmp (which is a separate tmpfs in the container:
+  # a /tmp temp plus `mv` is a cross-device copy, i.e. no atomicity at all).
+  #
+  # $VAULT_DIR/.git is the one directory that is guaranteed to be both on that
+  # filesystem and invisible to the rest of this daemon: git never tracks its
+  # own directory, and the inotify watch excludes it by name. Scratch inside the
+  # vault TREE would instead be staged by the next `git add -A` if the process
+  # died mid-encode, committing a half-written image under a junk filename.
+  tmp_home="$VAULT_DIR/.git"
+  [ -d "$tmp_home" ] || return 1
+  # Sweep any scratch left behind by an earlier kill. Safe to do unconditionally
+  # because the reconcile loop is single-threaded: no other pass can be holding
+  # one of these while this one runs.
+  rm -rf "$tmp_home"/vault-bridge-compress.* 2>/dev/null || true
+  work="$(mktemp -d "$tmp_home/vault-bridge-compress.XXXXXX" 2>/dev/null)" || return 1
   tmp="$work/reencoded.$ext"
   for rung in "88 0" "80 2560" "72 1800" "64 1280"; do
     q="${rung%% *}"; dim="${rung##* }"
@@ -678,9 +763,11 @@ compress_to_fit() {
     [ "$new" -le "$max_bytes" ] || continue
     # Last gate before the original is destroyed: the candidate must decode.
     image_verify "$backend" "$tmp" || continue
-    # Copy the bytes rather than mv: keeps the original inode, permissions and
-    # any hardlink, and works across the tmpfs/volume boundary.
-    cat "$tmp" > "$path" 2>/dev/null || { rm -rf "$work"; return 1; }
+    # The original is destroyed HERE, and git has no copy of it (it was refused
+    # for being over the cap), so the swap has to be all-or-nothing. See
+    # replace_file_atomically: it preserves mode and ownership, fsyncs, and
+    # renames. A failure leaves the original exactly as it was.
+    replace_file_atomically "$tmp" "$path" || { rm -rf "$work"; return 1; }
     rm -rf "$work"
     git -C "$VAULT_DIR" add -- "$rel" 2>/dev/null || return 1
     if [ "$dim" -gt 0 ]; then dimnote=", longest side ${dim}px"; else dimnote=", original dimensions"; fi

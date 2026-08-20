@@ -79,10 +79,38 @@ negotiable:
 | Least destructive first | Quality 88 at original size, then 80/2560px, 72/1800px, 64/1280px. It stops at the **first** rung that fits. Never upscales. |
 | Logged | `COMPRESSED: 'Attachments/photo.jpg' 12 MB -> 3 MB (vips, quality 80, longest side 2560px) - now under the 5 MB sync cap, committing it` |
 | The refusal is still the floor | If no rung gets under the cap, the original is left untouched on disk and withheld from the commit exactly as before. A still-oversized file is never committed. |
+| Atomic write-back | The re-encode is written to scratch on the vault's own volume, fsynced, and moved over the original with `rename()`. At every instant the file on disk is one whole image or the other. |
 
 Nothing is written back unless the result is both smaller than the original **and** under the
 cap; the original file is replaced only at that point, so a failed or partial encode cannot
 leave a damaged file behind.
+
+### Why the write-back is a rename and not a copy
+
+This is the one path where **git holds no fallback copy**. A file only gets here by being
+over the cap, which means it was refused and therefore never committed — so if the write-back
+is interrupted half way, the surviving fragment is the only thing left, anywhere.
+
+The obvious implementation, `cat "$tmp" > "$photo.jpg"`, has exactly that hole: `>` truncates
+the destination the moment it opens it, and the user's only copy is gone for the whole
+duration of the copy. Killed part way through a 3 MB image, that leaves 4096 bytes and
+nothing else. So the re-encode is instead written beside the destination, fsynced, and
+`rename()`d into place — atomic within one filesystem, so a reader (or a crash, or a redeploy)
+sees the whole original or the whole re-encode and never a fragment.
+
+Two consequences worth knowing, because the trade is real:
+
+- **The scratch file lives under `VAULT_DIR/.git/`**, not `/tmp`. It has to be on the
+  destination's filesystem or `mv` degrades to a cross-device copy with the same hole; and
+  `.git` is the one place on that volume git never tracks and the inotify watch already
+  excludes, so a scratch file left by a kill cannot be committed by the next pass.
+- **The destination's inode changes.** Mode and ownership are copied across deliberately, but
+  a pre-existing hardlink to the image keeps pointing at the old content. Nothing in this
+  system consults a vault file's inode — the watch is recursive over directories, and git
+  stores content — so atomicity is the better half of that trade.
+
+`test_atomic_replace.sh` pins all of it, including a loop that kills the swap part way through
+a 64 MB payload and requires a whole file every time.
 
 ### Turning it on, per deployment mode
 

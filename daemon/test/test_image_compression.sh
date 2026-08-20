@@ -51,6 +51,8 @@ extract_fn() { awk -v fn="$1" 'index($0, fn "()") == 1, /^}$/' "$BRIDGE"; }
   extract_fn image_backend
   extract_fn image_reencode
   extract_fn image_verify
+  extract_fn fsync_path
+  extract_fn replace_file_atomically
   extract_fn compress_to_fit
   extract_fn enforce_size_cap
 } > "$TMP/cap.sh"
