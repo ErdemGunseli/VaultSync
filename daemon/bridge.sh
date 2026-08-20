@@ -17,12 +17,16 @@
 #     collision that git cannot merge becomes an Obsidian-style
 #     "Note (conflicted copy <timestamp>).md" committed INTO the vault - it
 #     surfaces on every device, inside Obsidian, exactly where Sync's own
-#     conflicts appear. Never force-push; git history keeps every side of every
-#     conflict, so nothing is ever lost.
+#     conflicts appear. A collision under a HIDDEN path (any dotfolder or
+#     dotfile, .obsidian/ included) cannot surface that way, so it takes the
+#     loud path instead: no copy, merge aborted, WARNING. Never force-push; git
+#     history keeps every side of every conflict, so nothing is ever lost.
 #   - Refuse rather than corrupt: a file over the Sync cap is never committed, and
 #     a pass that would delete most of the vault is refused outright (see
 #     guard_mass_deletion) - git keeps everything, but a vault-emptying commit
-#     would otherwise reach every device within one poll.
+#     would otherwise reach every device within one poll. VAULT_COMPRESS_IMAGES
+#     is the one opt-in relaxation of the cap, and it never relaxes the refusal
+#     itself - see compress_to_fit.
 #   - Fail-soft: unset VAULT_REPO idles; missing/unauthenticated ob degrades to
 #     git-only with a WARNING rather than crash-looping. Missing `inotifywait`
 #     degrades to interval-only polling with a WARNING, same spirit.
@@ -64,6 +68,20 @@
 #                                     files over 5MB, so pushing one via git
 #                                     would never reach devices). 0 disables.
 #                                     (default 5)
+#   VAULT_COMPRESS_IMAGES             OFF by default. When truthy, an image
+#                                     ALREADY over VAULT_MAX_FILE_MB is
+#                                     re-encoded in place to try to fit under
+#                                     it, instead of being refused outright.
+#                                     Only jpg/jpeg/png/webp, never anything
+#                                     under the cap, never an LFS-tracked path,
+#                                     and every re-encode is logged with its
+#                                     before/after size. The refusal above is
+#                                     still the floor: a file compression cannot
+#                                     shrink enough is withheld exactly as
+#                                     before. This is the ONLY place the daemon
+#                                     rewrites a file's contents, and the
+#                                     re-encode is lossy and irreversible -
+#                                     hence opt-in.
 #   VAULT_MAX_DELETE_PCT              a pass deleting at least this % of tracked
 #                                     files is REFUSED, not committed (default
 #                                     50; 0 disables). Guards against anything
@@ -447,6 +465,11 @@ debounce_drain() {
 }
 
 # --- 4. Sync-cap guard: files over VAULT_MAX_FILE_MB are unstaged, not committed
+#
+# Opt-in escape hatch: an image ALREADY over the cap may be re-encoded to fit
+# before the refusal applies (see compress_to_fit). The refusal itself is
+# unchanged and remains the floor - if the re-encode does not get the file under
+# the cap, the file is withheld exactly as it always was.
 enforce_size_cap() {
   [ "$MAX_FILE_MB" -gt 0 ] || return 0
   local max_bytes=$(( MAX_FILE_MB * 1024 * 1024 ))
@@ -460,11 +483,216 @@ enforce_size_cap() {
     [ -f "$path" ] || continue
     size="$(stat -c%s "$path" 2>/dev/null || wc -c < "$path" 2>/dev/null || echo 0)"
     if [ "$size" -gt "$max_bytes" ]; then
+      # Only reached by a file that is ALREADY refused today. A no-op unless
+      # compression is switched on, and it returns 0 only when the file on disk
+      # is now genuinely under the cap and re-staged.
+      compress_to_fit "$f" "$path" "$size" "$max_bytes" && continue
       git -C "$VAULT_DIR" reset -q -- "$f" 2>/dev/null
       size_mb=$(( (size + 1048575) / 1048576 ))
       log "WARNING: $f exceeds sync cap (${size_mb} MB) - NOT committed; raise VAULT_MAX_FILE_MB or use LFS+exclusion deliberately"
     fi
   done
+}
+
+# --- 4a. Opt-in image compression, tried only where the cap would otherwise
+#         refuse outright ----------------------------------------------------
+# The daemon is content-agnostic everywhere else: it moves bytes and resolves
+# conflicts, and never inspects or rewrites what is inside a file. This is the
+# one exception, and re-encoding is lossy and irreversible - for a photo the
+# vault may hold the only remaining copy. So it is deliberately narrow and loud:
+#
+#   - OFF unless VAULT_COMPRESS_IMAGES is set truthy. Nobody's behaviour changes
+#     without opting in.
+#   - Only files ALREADY over the cap. Under the cap, nothing is ever touched.
+#   - Only an explicit image-extension allowlist, matched case-insensitively.
+#     No other file type is ever rewritten.
+#   - Never an LFS-tracked path (see below).
+#   - The replacement is decoded and verified before it overwrites anything.
+#   - Every re-encode logged with the path and its before/after sizes.
+#   - The hard refusal stays the floor: a file that cannot be brought under the
+#     cap is withheld exactly as before. A still-oversized file is never
+#     committed, whatever this function does.
+compress_enabled() {
+  case "${VAULT_COMPRESS_IMAGES:-0}" in
+    1|on|ON|true|TRUE|True|yes|YES|Yes) return 0 ;;
+    *)                                  return 1 ;;
+  esac
+}
+
+# Whichever image tool is present, preferring libvips: it is small, fast,
+# low-memory, has a far better CVE record than ImageMagick, and is what the
+# container ships (see Dockerfile). python3 + Pillow is the fallback for a
+# bridge running outside that image. Neither present => prints nothing, and
+# compression never happens - same capability-detection shape as inotifywait,
+# ob and git-lfs elsewhere in this daemon.
+image_backend() {
+  if command -v vips >/dev/null 2>&1; then
+    printf 'vips'
+  elif command -v python3 >/dev/null 2>&1 && python3 -c 'import PIL' >/dev/null 2>&1; then
+    printf 'pillow'
+  fi
+}
+
+# Re-encode $src into $dst at quality $q, longest side capped at $dim px
+# (0 = keep the original dimensions). The output format is chosen from $dst's
+# extension by BOTH backends, so a mislabelled file cannot silently change type.
+# Never upscales. Returns non-zero if the encode fails for any reason.
+image_reencode() {
+  local backend="$1" src="$2" dst="$3" q="$4" dim="$5" ext opts
+  ext="$(printf '%s' "${dst##*.}" | tr '[:upper:]' '[:lower:]')"
+  case "$backend" in
+    vips)
+      # PNG has no quality knob; `palette` is libvips' lossy-PNG equivalent.
+      case "$ext" in
+        png) opts="[Q=$q,palette]" ;;
+        *)   opts="[Q=$q]" ;;
+      esac
+      if [ "$dim" -gt 0 ]; then
+        vips thumbnail "$src" "$dst$opts" "$dim" --size down >/dev/null 2>&1
+      else
+        vips copy "$src" "$dst$opts" >/dev/null 2>&1
+      fi
+      ;;
+    pillow)
+      python3 - "$src" "$dst" "$q" "$dim" >/dev/null 2>&1 <<'PYEOF'
+import os
+import sys
+
+from PIL import Image
+
+src, dst, q, dim = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+ext = os.path.splitext(dst)[1].lower().lstrip(".")
+fmt = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}.get(ext)
+if not fmt:
+    sys.exit(3)
+im = Image.open(src)
+im.load()
+if dim > 0:
+    im.thumbnail((dim, dim))          # never upscales
+if fmt == "JPEG":
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    im.save(dst, fmt, quality=q, optimize=True)
+elif fmt == "PNG":
+    if im.mode in ("RGBA", "LA", "PA"):
+        im = im.quantize(colors=256, method=2)   # FASTOCTREE keeps alpha
+    elif im.mode != "P":
+        im = im.convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=256)
+    im.save(dst, fmt, optimize=True)
+else:
+    im.save(dst, fmt, quality=q)
+PYEOF
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Fully DECODE an image and fail if it is truncated or corrupt. This runs on the
+# re-encoded candidate before it is allowed to overwrite the original, because a
+# non-zero exit from the encoder is the only other thing standing between a
+# half-written file and the user's only copy of a photo.
+#
+# The exact incantations matter and were measured, not assumed:
+#   - `vips header` is NOT a libvips action (the binary is `vipsheader`), so it
+#     exits non-zero on every file, good or bad - a check like that would have
+#     silently disabled compression rather than guarding it.
+#   - plain `vips avg` returns SUCCESS on a JPEG truncated to half its bytes;
+#     libvips fills the missing scanlines and carries on. `fail_on=truncated` is
+#     what actually turns that into an error.
+image_verify() {
+  local backend="$1" path="$2"
+  [ -s "$path" ] || return 1
+  case "$backend" in
+    vips)   vips avg "${path}[fail_on=truncated]" >/dev/null 2>&1 ;;
+    pillow) python3 - "$path" >/dev/null 2>&1 <<'PYEOF'
+import sys
+
+from PIL import Image
+
+im = Image.open(sys.argv[1])
+im.load()          # raises on a truncated or corrupt file
+PYEOF
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Try to bring an already-oversize image under the cap. Returns 0 ONLY when the
+# working-tree file is now genuinely under the cap and re-staged; every other
+# outcome returns non-zero so the caller applies the unchanged hard refusal.
+compress_to_fit() {
+  local rel="$1" path="$2" orig="$3" max_bytes="$4"
+  compress_enabled || return 1
+
+  # Raster formats that survive a re-encode into THE SAME extension.
+  # Deliberately excludes .gif (would lose animation), .svg (vector - there is
+  # no "re-encode", only rewriting markup), and .heic/.tiff (Obsidian does not
+  # render them anyway, so a lossy rewrite buys nothing).
+  local image_exts="jpg jpeg png webp"
+  local ext
+  ext="$(printf '%s' "${rel##*.}" | tr '[:upper:]' '[:lower:]')"
+  # KEEP "$ext" QUOTED. An extension is just part of a filename, so it can
+  # legitimately contain glob metacharacters - and an unquoted expansion in a
+  # `case` pattern is a pattern, not a string: 'photo.j[p]g' would then match
+  # 'jpg' and be sent to an encoder that cannot write that file. Quoted, it is
+  # compared literally, which is what an allowlist means. (Verified both ways;
+  # test_image_compression.sh case 8c fails if the quotes are dropped.)
+  case " $image_exts " in
+    *" $ext "*) ;;
+    *)          return 1 ;;
+  esac
+
+  # An LFS-tracked path is committed as a small pointer whatever the working
+  # tree holds, so re-encoding it would destroy pixels for no size gain at all.
+  # (The cap itself measures the working-tree file and therefore still refuses
+  # such a path at full size - a pre-existing quirk this change does not alter.)
+  if git -C "$VAULT_DIR" check-attr filter -- "$rel" 2>/dev/null | grep -q ': filter: lfs$'; then
+    log "COMPRESS: skipping '$rel' - it is git-lfs tracked, so a re-encode would lose"
+    log "          pixels without shrinking what git actually stores."
+    return 1
+  fi
+
+  local backend
+  backend="$(image_backend)"
+  if [ -z "$backend" ]; then
+    log "COMPRESS: '$rel' is over the cap and VAULT_COMPRESS_IMAGES is on, but no image"
+    log "          tool is available (install libvips-tools, or python3 with Pillow)."
+    log "          Refusing the file exactly as if compression were off."
+    return 1
+  fi
+
+  # Quality first, then progressively smaller dimensions. Stops at the FIRST
+  # rung that fits, so the least destructive re-encode that works is the one
+  # that ships.
+  local work tmp rung q dim dimnote new
+  work="$(mktemp -d 2>/dev/null)" || return 1
+  tmp="$work/reencoded.$ext"
+  for rung in "88 0" "80 2560" "72 1800" "64 1280"; do
+    q="${rung%% *}"; dim="${rung##* }"
+    rm -f "$tmp"
+    image_reencode "$backend" "$path" "$tmp" "$q" "$dim" || continue
+    [ -s "$tmp" ] || continue
+    new="$(stat -c%s "$tmp" 2>/dev/null || wc -c < "$tmp" 2>/dev/null || echo 0)"
+    # A "compression" that grew the file is not one. Never write it back.
+    [ "$new" -lt "$orig" ] || continue
+    [ "$new" -le "$max_bytes" ] || continue
+    # Last gate before the original is destroyed: the candidate must decode.
+    image_verify "$backend" "$tmp" || continue
+    # Copy the bytes rather than mv: keeps the original inode, permissions and
+    # any hardlink, and works across the tmpfs/volume boundary.
+    cat "$tmp" > "$path" 2>/dev/null || { rm -rf "$work"; return 1; }
+    rm -rf "$work"
+    git -C "$VAULT_DIR" add -- "$rel" 2>/dev/null || return 1
+    if [ "$dim" -gt 0 ]; then dimnote=", longest side ${dim}px"; else dimnote=", original dimensions"; fi
+    log "COMPRESSED: '$rel' $(( (orig + 1048575) / 1048576 )) MB -> $(( (new + 1048575) / 1048576 )) MB" \
+        "(${orig} -> ${new} bytes; ${backend}, quality ${q}${dimnote})" \
+        "- now under the ${MAX_FILE_MB} MB sync cap, committing it"
+    return 0
+  done
+  rm -rf "$work"
+  log "COMPRESS: could not bring '$rel' under the ${MAX_FILE_MB} MB cap - re-encoding was"
+  log "          tried down to 1280px and it is still too big. Refusing it as usual."
+  return 1
 }
 
 # --- 4b. Mass-deletion guard: refuse to propagate a vault-emptying commit -----
@@ -536,10 +764,50 @@ git_net() { timeout "$GIT_TIMEOUT" git -C "$VAULT_DIR" "$@"; }
 # inside Obsidian, not in a server log. Both sides are in git history either
 # way; nothing is lost. Any per-file failure aborts the merge and reverts to
 # the old freeze-and-log behaviour (fail-soft, never guess).
+#
+# EXCEPT under a hidden path - see hidden_path() below.
+
+# True when ANY component of a repo-relative path starts with a dot: a dotfolder
+# ('.agent-memory/sessions/x.md', '.obsidian/appearance.json') or a dotfile
+# ('.gitignore'). Obsidian renders neither, which is the whole point: a
+# conflicted copy is a SURFACING mechanism, and one written here surfaces
+# nowhere. The vault repo's own .gitignore says so explicitly - conflicted
+# copies are deliberately not ignored "so it appears on every device, inside
+# Obsidian" - and a copy no device renders is the silent failure that comment
+# exists to prevent, committed and pushed with a single log line as its only
+# trace.
+hidden_path() {
+  case "/$1" in
+    */.*) return 0 ;;
+    *)    return 1 ;;
+  esac
+}
 resolve_conflicts_sync_style() {
   local ts f base ext copy count=0
   ts="$(date -u '+%Y-%m-%d %H.%M.%S')"
-  local dir fn made_copy
+  local dir fn made_copy unmerged hidden_hits=""
+  unmerged="$(git -C "$VAULT_DIR" diff --name-only --diff-filter=U 2>/dev/null)"
+
+  # Check EVERY conflicted path before touching any of them. This resolver
+  # commits all of its work in one commit, so a mixed set (a note plus a
+  # dotfolder file) must not half-resolve: returning 1 here leaves the merge
+  # exactly as git left it, which is what the caller's `merge --abort` needs to
+  # restore a clean tree.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    hidden_path "$f" && hidden_hits="$hidden_hits '$f'"
+  done <<EOF
+$unmerged
+EOF
+  if [ -n "$hidden_hits" ]; then
+    log "CONFLICT under a hidden path -$hidden_hits"
+    log "         NO conflicted copy was made: Obsidian shows neither dotfolders nor"
+    log "         dotfiles, so the copy would be invisible on every device - a conflict"
+    log "         resolved into a file nobody can see. Stopping instead, loudly."
+    log "         Nothing is lost: git history holds both sides. Resolve it in a clone."
+    return 1
+  fi
+
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     # Split the extension off the FILE NAME only, never the path - a note in a
@@ -587,7 +855,7 @@ resolve_conflicts_sync_style() {
     fi
     count=$(( count + 1 ))
   done <<EOF
-$(git -C "$VAULT_DIR" diff --name-only --diff-filter=U 2>/dev/null)
+$unmerged
 EOF
   [ "$count" -gt 0 ] || return 1
   # Conflicted copies are staged blobs like any other: apply the same cap here,

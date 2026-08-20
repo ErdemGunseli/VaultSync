@@ -26,9 +26,15 @@ check() {
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP" "$GIT_ISOLATED_CONFIG"' EXIT
 
-# Extract the real resolver (and the log helper it calls) from bridge.sh.
+# Extract the real resolver, plus every bridge.sh function it calls, plus the
+# log helper. The call graph must be COMPLETE: an undefined function under
+# `set +u` is just a command-not-found returning 127, which several call sites
+# here read as a meaningful "no" - so a missing extraction does not error, it
+# silently stands in for one particular answer and the test stops exercising
+# the real code.
 {
   echo 'log() { printf "[test] %s\n" "$*"; }'
+  awk '/^hidden_path\(\)/,/^}$/' "$BRIDGE"
   awk '/^resolve_conflicts_sync_style\(\)/,/^}$/' "$BRIDGE"
 } > "$TMP/resolver.sh"
 grep -q 'resolve_conflicts_sync_style()' "$TMP/resolver.sh"
@@ -93,9 +99,17 @@ check "case C: conflicted copy landed in the right directory" "1" "$copies"
 {
   echo 'log() { printf "[test] %s\n" "$*"; }'
   echo 'MAX_FILE_MB="${VAULT_MAX_FILE_MB:-5}"'
+  awk '/^hidden_path\(\)/,/^}$/' "$BRIDGE"
+  awk '/^compress_enabled\(\)/,/^}$/' "$BRIDGE"
+  awk '/^image_backend\(\)/,/^}$/' "$BRIDGE"
+  awk '/^image_reencode\(\)/,/^}$/' "$BRIDGE"
+  awk '/^image_verify\(\)/,/^}$/' "$BRIDGE"
+  awk '/^compress_to_fit\(\)/,/^}$/' "$BRIDGE"
   awk '/^enforce_size_cap\(\)/,/^}$/' "$BRIDGE"
   awk '/^resolve_conflicts_sync_style\(\)/,/^}$/' "$BRIDGE"
 } > "$TMP/resolver_cap.sh"
+bash -n "$TMP/resolver_cap.sh" 2>/dev/null
+check "the extracted cap+resolver call graph is valid shell" "0" "$?"
 
 # Built from scratch: calling make_conflict first would leave the tree already
 # conflicted, so the follow-up checkout fails and NO conflict gets constructed -
