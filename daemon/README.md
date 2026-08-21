@@ -3,8 +3,117 @@
 The project overview, design laws, configuration table and install steps live in the
 [repo root `README.md`](../README.md); `docs/` carries the architecture. This file is the
 operator reference for the two behaviours of `bridge.sh` that are easiest to get wrong in
-practice: what happens when a collision lands somewhere Obsidian cannot render, and the
-opt-in image compression that is the one place this daemon rewrites your files.
+practice: which of the two transports carries your `.obsidian/` folder, what happens when a
+collision lands somewhere Obsidian cannot render, and the opt-in image compression that is
+the one place this daemon rewrites your files.
+
+---
+
+## Two transports move a bridged vault, and only one carries `.obsidian/`
+
+This is the single most confusing thing about a bridged vault, and it cost a full day before
+it was understood. There are **two** hops between your git repo and your phone, they are
+independent, and they do not agree about configuration:
+
+```
+GitHub  <--- git, carries EVERYTHING tracked --->  VAULT_DIR on the worker
+VAULT_DIR on the worker  <--- Obsidian Sync, SELECTIVE --->  your devices
+```
+
+The first hop is git. It carries every tracked byte, `.obsidian/` and all fourteen of your
+plugins included. Nothing about it is selective.
+
+The second hop is Obsidian Sync, and Sync carries `.obsidian/` **only when it has been told
+to, per vault, in eight named categories**. `ob sync-setup` — the command this daemon uses to
+link a vault — writes no such setting at all, and Sync reads an absent setting as *none*. So
+the default state of a freshly linked vault is **config syncing entirely off**.
+
+### The symptom, and why it is so hard to diagnose
+
+Every device shows **"You currently have 0 plugins installed"**, with Restricted mode off and
+the Sync toggles for *Core plugin settings*, *Active community plugin list* and *Installed
+community plugins* all switched **on**.
+
+Those toggles are not lying and they are not the problem. They control what a device is
+willing to **receive**. If the remote was never given the plugins, there is nothing to send
+down, and a device configured perfectly still shows zero. Both halves have to be right:
+
+| Where | What it controls | Symptom when wrong |
+|---|---|---|
+| The daemon (`VAULT_SYNC_CONFIGS`) | what the worker **uploads** into the Sync remote | every device shows zero, however its toggles are set |
+| The device (Settings → Sync → toggles) | what that device **downloads** | that one device shows zero, others are fine |
+
+So: **if one device is missing plugins, check that device. If every device is missing them,
+check the daemon.**
+
+### What the daemon does now
+
+`bridge.sh` passes `--configs` on **every** `ob sync-config` call, and its default is all
+eight categories Obsidian Sync exposes:
+
+```
+app, appearance, appearance-data, hotkey,
+core-plugin, core-plugin-data, community-plugin, community-plugin-data
+```
+
+`community-plugin-data` is the one that carries the installed plugin files; `core-plugin` and
+`core-plugin-data` cover the built-ins; `appearance-data` covers themes and CSS snippets.
+
+That is the right default for *this* daemon specifically: it exists to bridge a vault whose
+`.obsidian/` is versioned in git, and carrying the notes but not the configuration that
+renders them is the wrong half of the job.
+
+The flag is now always passed, empty included, because omitting it is **not** "use a default"
+— `ob` leaves whatever is already stored untouched when the flag is absent, which is exactly
+how a vault stayed at *none* forever.
+
+### It is logged, in two places
+
+A silent configuration decision is what made this expensive. At link time:
+
+```
+[vault-bridge:planning] sync-config: asking Obsidian Sync to carry config categories:
+                        app,appearance,appearance-data,hotkey,core-plugin,core-plugin-data,community-plugin,community-plugin-data
+```
+
+and in every heartbeat, so the state is answerable from logs at any moment, not only at boot:
+
+```
+[vault-bridge:planning] heartbeat: HEAD=a1b2c3d uncommitted=0 poll=15s ob=1 ob_quiet=42s configs=ok:app,appearance,…
+```
+
+`configs=` reads `<state>:<list>`, where state is `ok` (applied), `FAILED` (the call was
+rejected — the category names and the conflict strategy are both unchanged) or `unset` (the
+vault is not linked to Sync at all).
+
+### Applying it to a vault that is already linked
+
+`ob sync-config` is idempotent and the daemon re-asserts it on **every boot**, including for a
+vault that is already linked. A redeploy is therefore all that is needed to heal a vault that
+was linked under the old behaviour — no unlink, no re-link, no re-download.
+
+The first sync pass after that redeploy uploads `.obsidian/` to the Sync remote; devices pick
+it up on their next sync, and Obsidian asks to restart once the plugin files land.
+
+### Carrying less
+
+`VAULT_SYNC_CONFIGS` still overrides, and takes any comma-separated subset of the eight names
+above:
+
+```bash
+VAULT_SYNC_CONFIGS=app,appearance,core-plugin,community-plugin   # settings, no plugin files
+VAULT_SYNC_CONFIGS=                                             # carry no config at all
+```
+
+An **explicitly empty** value means off, and the daemon says so loudly rather than quietly
+falling back to the default. Note that only the secret-file and plain deployment modes can
+express "explicitly empty"; the env-group mode skips empty values, so a vault there falls back
+to the full default.
+
+An invalid category name makes `ob sync-config` reject the **whole** call, taking the conflict
+strategy down with the categories — which is why the default list is pinned literally in
+`bridge.sh` and checked against `ob sync-config --help` when the pinned `obsidian-headless`
+version in the `Dockerfile` is bumped.
 
 ---
 
@@ -173,8 +282,8 @@ knowing Sync will not carry the file to devices either way.
 bash daemon/test/run.sh
 ```
 
-`test_conflict_dotfolder.sh` and `test_image_compression.sh` cover the two behaviours above.
-Both follow the house style described in the root README: the real functions are extracted
+`test_sync_configs.sh`, `test_conflict_dotfolder.sh` and `test_image_compression.sh` cover the
+three behaviours above. They follow the house style described in the root README: the real functions are extracted
 from `bridge.sh` and executed against real git repositories, every case asserts the scenario
 was actually constructed before asserting the outcome, and each new behaviour has been
 mutation-tested — broken on purpose to confirm the test goes red.

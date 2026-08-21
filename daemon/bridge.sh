@@ -114,7 +114,13 @@
 #                                     remote vault is encrypted - omitting it
 #                                     makes `ob sync-setup` prompt, which fails
 #                                     headless)
-#   VAULT_SYNC_CONFIGS                optional comma list for `ob sync-config --configs`
+#   VAULT_SYNC_CONFIGS                comma list for `ob sync-config --configs`
+#                                     (which .obsidian/ categories Obsidian Sync
+#                                     carries to devices). DEFAULTS TO ALL EIGHT
+#                                     - see SYNC_CONFIGS_DEFAULT below. Set it
+#                                     to a narrower list to carry less, or to
+#                                     the empty string to disable config syncing
+#                                     entirely.
 #   VAULT_DEVICE_NAME                 device label in Sync version history
 #   OBSIDIAN_AUTH_TOKEN               PREFERRED auth: `ob` reads this env var
 #                                     directly, so no login call and no MFA.
@@ -129,7 +135,32 @@ VAULT_REPO="${VAULT_REPO:-}"
 VAULT_BRANCH="${VAULT_BRANCH:-main}"
 SYNC_REMOTE="${VAULT_SYNC_REMOTE:-}"
 SYNC_ENC_PW="${VAULT_SYNC_ENCRYPTION_PASSWORD:-}"
-SYNC_CONFIGS="${VAULT_SYNC_CONFIGS:-}"
+# Two transports move a bridged vault and only one of them is selective.
+# git <-> VAULT_DIR carries every tracked byte, .obsidian/ included. Obsidian
+# Sync moves VAULT_DIR <-> devices and carries ONLY the config categories its
+# stored per-vault config names - and `ob sync-setup` writes no such key at all,
+# which the sync engine reads as `new Set(undefined || [])`: an EMPTY set, i.e.
+# config syncing fully off (obsidian-headless 0.0.14 cli.js prints exactly
+# "none (config syncing disabled)" for that state). So a vault whose .obsidian/
+# tree is complete in git and on disk still lands on every device with zero
+# plugins, zero themes and zero hotkeys, and nothing in either log says why.
+# That cost the owner a day.
+#
+# This daemon exists to bridge a vault whose .obsidian/ is versioned in git.
+# Carrying the notes but not the configuration that renders them is the wrong
+# default for that job, so the default here is ALL EIGHT categories `ob`
+# accepts. The list is pinned literally rather than discovered, because an
+# invalid member makes `sync-config` exit non-zero and refuse the whole call
+# (cli.js Vr() throws on the first unknown name), which would take the conflict
+# strategy down with it. Verified against `ob sync-config --help` on 0.0.14; the
+# Dockerfile pins that version, so re-check this list when bumping it.
+SYNC_CONFIGS_DEFAULT="app,appearance,appearance-data,hotkey,core-plugin,core-plugin-data,community-plugin,community-plugin-data"
+# `-` not `:-`: an operator who writes VAULT_SYNC_CONFIGS= in an env file means
+# "carry no config", and that must not silently become the full default.
+SYNC_CONFIGS="${VAULT_SYNC_CONFIGS-$SYNC_CONFIGS_DEFAULT}"
+# Reported in the heartbeat so the choice is answerable from logs alone, which
+# is precisely what was missing. Set by apply_sync_config.
+SYNC_CONFIGS_STATE="unset"
 DEVICE_NAME="${VAULT_DEVICE_NAME:-vault-bridge-$NAME}"
 GIT_NAME="${GIT_AUTHOR_NAME:-vault-bridge}"
 GIT_EMAIL="${GIT_AUTHOR_EMAIL:-vault-bridge@localhost}"
@@ -314,8 +345,45 @@ ensure_ob_auth() {
   return 1
 }
 
+# Push the conflict strategy, mode and config categories at the stored per-vault
+# sync config. Split out of the link step deliberately: `sync-config` is
+# idempotent and `ensure_ob_setup` returns early for an ALREADY-linked vault, so
+# leaving this inline meant a settings change could only ever reach a vault that
+# had never been linked. Every existing bridge would keep its original settings
+# forever, with a redeploy looking like it had applied them. It runs on both
+# paths now, so a redeploy heals a vault linked under an older default.
+apply_sync_config() {
+  # Conflict policy is a design law: match Sync's own end-to-end behaviour.
+  # Sync's default strategy auto-merges concurrent device edits; forcing
+  # `conflict` here would make the bridged experience WORSE than plain Sync
+  # (conflict litter a Sync-only user never sees). Git history is the safety
+  # net that makes merge safe: every pre-merge state is a commit.
+  set -- sync-config --path "$VAULT_DIR" --conflict-strategy merge --mode bidirectional
+  # Always passed, empty included. Omitting the flag is NOT "use a default" -
+  # cli.js gates on `configs !== undefined`, so an omitted flag leaves whatever
+  # is already stored untouched, which is the bug this whole block exists to
+  # close. An explicit empty string is `ob`'s own documented "clear".
+  set -- "$@" --configs "$SYNC_CONFIGS"
+  if [ -n "$SYNC_CONFIGS" ]; then
+    log "sync-config: asking Obsidian Sync to carry config categories: $SYNC_CONFIGS"
+  else
+    log "sync-config: VAULT_SYNC_CONFIGS is empty - Obsidian Sync will carry NO .obsidian/ config."
+    log "             Devices will show no plugins, themes or hotkeys from this vault."
+  fi
+  if ob_q "$@"; then
+    SYNC_CONFIGS_STATE="ok"
+    return 0
+  fi
+  SYNC_CONFIGS_STATE="FAILED"
+  log "WARNING: sync-config failed - conflict strategy AND config categories are unchanged."
+  log "         Devices may receive no .obsidian/ config. Check the category names against"
+  log "         'ob sync-config --help' for the pinned obsidian-headless version."
+  return 1
+}
+
 ensure_ob_setup() {
   if ob_q sync-status --path "$VAULT_DIR"; then
+    apply_sync_config   # re-assert on every boot; heals an older linked vault
     return 0   # already linked
   fi
   if [ -z "$SYNC_REMOTE" ]; then
@@ -335,14 +403,7 @@ ensure_ob_setup() {
     log "WARNING: sync-setup failed (wrong vault name, wrong encryption password, or auth)."
     return 1
   fi
-  # Conflict policy is a design law: match Sync's own end-to-end behaviour.
-  # Sync's default strategy auto-merges concurrent device edits; forcing
-  # `conflict` here would make the bridged experience WORSE than plain Sync
-  # (conflict litter a Sync-only user never sees). Git history is the safety
-  # net that makes merge safe: every pre-merge state is a commit.
-  set -- sync-config --path "$VAULT_DIR" --conflict-strategy merge --mode bidirectional
-  [ -n "$SYNC_CONFIGS" ] && set -- "$@" --configs "$SYNC_CONFIGS"
-  ob_q "$@" || log "WARNING: sync-config failed (conflict strategy may default to merge)"
+  apply_sync_config
   return 0
 }
 
@@ -1078,7 +1139,10 @@ while true; do
       hb_head="$(git -C "$VAULT_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
       hb_dirty="$(git -C "$VAULT_DIR" status --porcelain 2>/dev/null | wc -l)"
       hb_obq="$(ob_silence_secs)"
-      log "heartbeat: HEAD=$hb_head uncommitted=$hb_dirty poll=${CURRENT_INTERVAL}s ob=${HAVE_OB} ob_quiet=${hb_obq}s"
+      # configs= is a plain variable read, so it costs nothing and answers the
+      # question no log line could answer before: which .obsidian/ categories
+      # this daemon asked Sync to carry, and whether that ask succeeded.
+      log "heartbeat: HEAD=$hb_head uncommitted=$hb_dirty poll=${CURRENT_INTERVAL}s ob=${HAVE_OB} ob_quiet=${hb_obq}s configs=${SYNC_CONFIGS_STATE}:${SYNC_CONFIGS:-none}"
       # The one failure this daemon could not see before: ob alive, git syncing,
       # devices silently receiving nothing.
       if [ "$HAVE_OB" -eq 1 ] && [ "$OB_SILENCE_WARN" -gt 0 ] && \
