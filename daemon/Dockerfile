@@ -11,8 +11,17 @@ FROM node:22-slim
 # SIGTERM actually reaches the bridges on redeploy), inotify-tools (fast local-
 # edit detection - the bridge falls back to interval-only polling, with a
 # WARNING, if this is ever missing at runtime).
+#
+# libvips-tools is the `vips` CLI, used ONLY by the opt-in image compression
+# path (VAULT_COMPRESS_IMAGES, off by default - see bridge.sh compress_to_fit).
+# libvips over ImageMagick deliberately: this process holds a push token for
+# every vault it bridges, so the decoder it points at untrusted image bytes is a
+# real attack surface, and libvips is both markedly smaller and has the better
+# CVE record. The bridge treats it as a capability, not a requirement: if it is
+# ever missing at runtime, compression is skipped and the oversize file is
+# refused exactly as it would be with the feature switched off.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git git-lfs bash ca-certificates tini inotify-tools \
+    && apt-get install -y --no-install-recommends git git-lfs bash ca-certificates tini inotify-tools libvips-tools \
     && git lfs install --skip-repo \
     && rm -rf /var/lib/apt/lists/*
 
