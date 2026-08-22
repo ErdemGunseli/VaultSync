@@ -121,6 +121,15 @@
 #                                     to a narrower list to carry less, or to
 #                                     the empty string to disable config syncing
 #                                     entirely.
+#   VAULT_SYNC_FILE_TYPES             comma list for `ob sync-config --file-types`
+#                                     (which attachment types Obsidian Sync
+#                                     carries: image, audio, video, pdf,
+#                                     unsupported). DEFAULTS TO ALL FIVE - a
+#                                     bridged vault's attachments and loose
+#                                     .js/.css are content, and "unsupported"
+#                                     is what carries anything not on the
+#                                     named list. Narrow it to carry less, or
+#                                     set the empty string to carry only .md.
 #   VAULT_DEVICE_NAME                 device label in Sync version history
 #   OBSIDIAN_AUTH_TOKEN               PREFERRED auth: `ob` reads this env var
 #                                     directly, so no login call and no MFA.
@@ -158,6 +167,8 @@ SYNC_CONFIGS_DEFAULT="app,appearance,appearance-data,hotkey,core-plugin,core-plu
 # `-` not `:-`: an operator who writes VAULT_SYNC_CONFIGS= in an env file means
 # "carry no config", and that must not silently become the full default.
 SYNC_CONFIGS="${VAULT_SYNC_CONFIGS-$SYNC_CONFIGS_DEFAULT}"
+SYNC_FILE_TYPES_DEFAULT="image,audio,video,pdf,unsupported"
+SYNC_FILE_TYPES="${VAULT_SYNC_FILE_TYPES-$SYNC_FILE_TYPES_DEFAULT}"
 # Reported in the heartbeat so the choice is answerable from logs alone, which
 # is precisely what was missing. Set by apply_sync_config.
 SYNC_CONFIGS_STATE="unset"
@@ -363,7 +374,12 @@ apply_sync_config() {
   # cli.js gates on `configs !== undefined`, so an omitted flag leaves whatever
   # is already stored untouched, which is the bug this whole block exists to
   # close. An explicit empty string is `ob`'s own documented "clear".
-  set -- "$@" --configs "$SYNC_CONFIGS"
+  set -- "$@" --configs "$SYNC_CONFIGS" --file-types "$SYNC_FILE_TYPES"
+  if [ -n "$SYNC_FILE_TYPES" ]; then
+    log "sync-config: asking Obsidian Sync to carry attachment types: $SYNC_FILE_TYPES"
+  else
+    log "sync-config: VAULT_SYNC_FILE_TYPES is empty - Obsidian Sync will carry markdown ONLY."
+  fi
   if [ -n "$SYNC_CONFIGS" ]; then
     log "sync-config: asking Obsidian Sync to carry config categories: $SYNC_CONFIGS"
   else

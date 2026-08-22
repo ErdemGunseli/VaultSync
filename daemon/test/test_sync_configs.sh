@@ -54,6 +54,8 @@ ob_q() { printf '%s\n' "\$@" >> "\$ARGV_FILE"; return \${OB_Q_RC:-0}; }
 HARNESS
   extract_line 'SYNC_CONFIGS_DEFAULT='
   extract_line 'SYNC_CONFIGS='
+  extract_line 'SYNC_FILE_TYPES_DEFAULT='
+  extract_line 'SYNC_FILE_TYPES='
   extract_line 'SYNC_CONFIGS_STATE='
   extract_fn apply_sync_config
 }
@@ -88,6 +90,13 @@ configs_arg() {
   awk '
     found { if ($0 == "") { print "<EMPTY>" } else { print }; exit }
     $0 == "--configs" { found = 1 }
+    END { if (!found) print "<MISSING>" }
+  ' "$TMP/argv"
+}
+filetypes_arg() {
+  awk '
+    found { if ($0 == "") { print "<EMPTY>" } else { print }; exit }
+    $0 == "--file-types" { found = 1 }
     END { if (!found) print "<MISSING>" }
   ' "$TMP/argv"
 }
@@ -162,7 +171,7 @@ check "VAULT_SYNC_CONFIGS= passes --configs with an empty value, ob's own clear"
 check "the empty case warns that devices will receive no config" \
   "1" "$(grep -c 'Obsidian Sync will carry NO .obsidian/ config' "$TMP/log")"
 check "the empty case does not claim to be carrying categories" \
-  "0" "$(grep -c 'asking Obsidian Sync to carry' "$TMP/log")"
+  "0" "$(grep -c 'carry config categories' "$TMP/log")"
 
 echo "--- a failed sync-config is loud, not silent ---"
 
@@ -222,6 +231,25 @@ check "the heartbeat names the applied category list" \
   "1" "$(printf '%s' "$hb" | grep -c "configs=ok:$ALL8")"
 check "the heartbeat still carries the pre-existing git-level fields" \
   "1" "$(printf '%s' "$hb" | grep -c 'HEAD=abc1234 uncommitted=0')"
+
+
+echo "--- attachment types: carried by default, narrowable, clearable ---"
+
+ALL5="image,audio,video,pdf,unsupported"
+
+{ harness; echo 'apply_sync_config'; } | env -i bash /dev/stdin
+check "--file-types is passed at all" "1" "$(grep -c -- '^--file-types$' "$TMP/argv")"
+check "the default carries all five attachment types" "$ALL5" "$(filetypes_arg)"
+check "the choice is answerable from the logs" "1" \
+  "$(grep -c "attachment types: $ALL5" "$TMP/log")"
+
+{ harness; echo 'apply_sync_config'; } | env -i VAULT_SYNC_FILE_TYPES="image,pdf" bash /dev/stdin
+check "VAULT_SYNC_FILE_TYPES narrows the list" "image,pdf" "$(filetypes_arg)"
+
+{ harness; echo 'apply_sync_config'; } | env -i VAULT_SYNC_FILE_TYPES= bash /dev/stdin
+check "explicit-empty means markdown only, not the default" "<EMPTY>" "$(filetypes_arg)"
+check "and warns that Sync will carry markdown ONLY" "1" \
+  "$(grep -c 'markdown ONLY' "$TMP/log")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
