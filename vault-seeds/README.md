@@ -26,8 +26,10 @@ git remote add origin <your-new-github-repo-url>
 git push -u origin main
 ```
 
-Then point VaultSync's daemon at the new repo (see the daemon's own setup docs) and open the
-folder as a fresh Obsidian vault.
+Then point VaultSync's daemon at the new repo (see [`docs/setup.md`](../docs/setup.md), or let
+the guided setup at [grok-obsidian.vercel.app](https://grok-obsidian.vercel.app) hand an agent
+the whole job) and open the folder as a fresh Obsidian vault. An agent following that runbook
+seeds the repo from here automatically when it is empty.
 
 ## Why two separate seeds
 

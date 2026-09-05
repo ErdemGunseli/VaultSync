@@ -1,7 +1,8 @@
 # `daemon/` — operator notes
 
 The project overview, design laws, configuration table and install steps live in the
-[repo root `README.md`](../README.md); `docs/` carries the architecture. This file is the
+[repo root `README.md`](../README.md); `docs/` carries the architecture; a guided setup that
+writes the install prompt for you lives at [grok-obsidian.vercel.app](https://grok-obsidian.vercel.app). This file is the
 operator reference for the two behaviours of `bridge.sh` that are easiest to get wrong in
 practice: which of the two transports carries your `.obsidian/` folder, what happens when a
 collision lands somewhere Obsidian cannot render, and the opt-in image compression that is

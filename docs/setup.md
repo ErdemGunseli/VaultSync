@@ -3,6 +3,10 @@
 The division of labour: **the owner supplies four values; an agent does everything
 else.** If you are an agent reading this, "everything else" is yours.
 
+> Prefer not to drive this by hand? [grok-obsidian.vercel.app](https://grok-obsidian.vercel.app)
+> asks three questions and writes a Grok Bot template (or a prompt for any agent) that runs this
+> runbook for you, including on the agent's own VM.
+
 ## What the owner does (once per vault system)
 
 1. **Create the vault content repo** on GitHub (private, empty).

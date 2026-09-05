@@ -5,3 +5,9 @@ vault-*.env
 # Local run artefacts
 /data/
 *.log
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
