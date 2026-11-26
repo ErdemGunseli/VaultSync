@@ -93,6 +93,8 @@ configs_arg() {
 }
 
 ALL8="app,appearance,appearance-data,hotkey,core-plugin,core-plugin-data,community-plugin,community-plugin-data"
+ALL5="image,audio,pdf,video,unsupported"
+file_types_arg() { awk '/^--file-types$/ { getline; print; found=1; exit } END { if (!found) print "<MISSING>" }' "$TMP/argv"; }
 
 echo "--- the default carries every config category ---"
 
@@ -102,6 +104,10 @@ check "with VAULT_SYNC_CONFIGS unset, --configs is passed at all" \
 check "with VAULT_SYNC_CONFIGS unset, --configs carries all eight categories" \
   "$ALL8" "$(configs_arg)"
 check "a successful sync-config records state ok" "ok" "$state"
+check "the default explicitly carries every file type including unsupported" "$ALL5" "$(file_types_arg)"
+check "the full file-type choice is visible in startup diagnostics" "1" \
+  "$(grep -c "sync-config: asking Obsidian Sync to carry file types: $ALL5" "$TMP/log")"
+check "file-type assertion does not change folder exclusions" "0" "$(grep -c '^--.*exclude' "$TMP/argv")"
 check "the category list is logged, so the choice is answerable from logs" \
   "1" "$(grep -c "sync-config: asking Obsidian Sync to carry config categories: $ALL8" "$TMP/log")"
 
@@ -150,6 +156,7 @@ check "an explicit narrower list is passed through verbatim" \
 check "the override is logged too" \
   "1" "$(grep -c 'carry config categories: app,appearance$' "$TMP/log")"
 check "an overridden successful call still records state ok" "ok" "$state"
+check "narrowing config categories never narrows visible file types" "$ALL5" "$(file_types_arg)"
 
 state="$(run_apply set "$ALL8")"
 check "an explicit full list is passed through verbatim" "$ALL8" "$(configs_arg)"
@@ -162,7 +169,8 @@ check "VAULT_SYNC_CONFIGS= passes --configs with an empty value, ob's own clear"
 check "the empty case warns that devices will receive no config" \
   "1" "$(grep -c 'Obsidian Sync will carry NO .obsidian/ config' "$TMP/log")"
 check "the empty case does not claim to be carrying categories" \
-  "0" "$(grep -c 'asking Obsidian Sync to carry' "$TMP/log")"
+  "0" "$(grep -c 'asking Obsidian Sync to carry config categories:' "$TMP/log")"
+check "disabling config categories still carries all visible file types" "$ALL5" "$(file_types_arg)"
 
 echo "--- a failed sync-config is loud, not silent ---"
 
@@ -198,6 +206,52 @@ check "the already-linked path DID run sync-config" \
   "1" "$(grep -c '^sync-config$' "$TMP/argv")"
 check "the already-linked path applied the full default category list" \
   "$ALL8" "$(configs_arg)"
+check "the already-linked path explicitly applies all file types" "$ALL5" "$(file_types_arg)"
+
+echo "--- persisted selective file types are healed on new and existing boots ---"
+
+# Match the pinned CLI's update semantics: an omitted --file-types leaves a
+# persisted list untouched. Existing exclusions are independent and never cleared.
+run_persisted_boot() {
+  {
+    harness
+    printf 'LINKED=%s\nCONFIG_FAIL=%s\n' "$1" "${2:-0}"
+    cat <<'PERSISTED'
+STORED_TYPES="image,audio,pdf,video"
+STORED_EXCLUSIONS="Owner excluded,Private/.cache"
+SYNC_REMOTE="fixture"; SYNC_ENC_PW=""; DEVICE_NAME="fixture"
+ob_q() {
+  printf '%s\n' "$@" >> "$ARGV_FILE"
+  if [ "$1" = sync-status ]; then [ "$LINKED" = 1 ]; return $?; fi
+  [ "$CONFIG_FAIL" = 0 ] || return 1
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --file-types) STORED_TYPES="$2"; shift 2;;
+      --excluded-folders|--exclude-folders|--exclude) STORED_EXCLUSIONS="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+}
+ob_v() { LINKED=1; printf 'SETUP-RAN\n' >> "$ARGV_FILE"; return 0; }
+PERSISTED
+    extract_fn ensure_ob_setup
+    echo 'ensure_ob_setup >/dev/null 2>&1; rc=$?'
+    echo 'printf "%s\n%s\n%s\n%s" "$STORED_TYPES" "$STORED_EXCLUSIONS" "$SYNC_CONFIGS_STATE" "$rc"'
+  } > "$TMP/persisted.sh"
+  env -u VAULT_SYNC_CONFIGS bash "$TMP/persisted.sh"
+}
+for linked in 0 1; do
+  persisted="$(run_persisted_boot "$linked")"
+  check "linked=$linked heals old persisted four-type filter" "$ALL5" "$(printf '%s' "$persisted" | sed -n '1p')"
+  check "linked=$linked preserves explicit folder exclusions" 'Owner excluded,Private/.cache' "$(printf '%s' "$persisted" | sed -n '2p')"
+  check "linked=$linked reports applied settings as ready" ok "$(printf '%s' "$persisted" | sed -n '3p')"
+done
+persisted="$(run_persisted_boot 1 1)"
+check "failed settings call preserves old file-type filter" 'image,audio,pdf,video' "$(printf '%s' "$persisted" | sed -n '1p')"
+check "failed settings call preserves exclusions" 'Owner excluded,Private/.cache' "$(printf '%s' "$persisted" | sed -n '2p')"
+check "failed settings call never reports ready" FAILED "$(printf '%s' "$persisted" | sed -n '3p')"
+check "failed settings call propagates failure to startup" 1 "$(printf '%s' "$persisted" | sed -n '4p')"
 
 echo "--- the heartbeat reports the config decision ---"
 
