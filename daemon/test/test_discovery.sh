@@ -15,7 +15,7 @@ PASS=0; FAIL=0
 make_stub() {
   cat > "$1" <<'STUB'
 #!/usr/bin/env bash
-echo "LAUNCHED name=${VAULT_NAME:-} repo=${VAULT_REPO:-} dir=${VAULT_DIR:-} token=${OBSIDIAN_AUTH_TOKEN:-} encpw=${VAULT_SYNC_ENCRYPTION_PASSWORD:-}"
+echo "LAUNCHED name=${VAULT_NAME:-} repo=${VAULT_REPO:-} dir=${VAULT_DIR:-} token=${OBSIDIAN_AUTH_TOKEN:-} encpw=${VAULT_SYNC_ENCRYPTION_PASSWORD:-} sparse=${VAULT_EXCLUDE_AGENT_MEMORY:-} cache=${VAULT_LFS_CACHE_BUDGET_BYTES:-} cacheinterval=${VAULT_LFS_CACHE_INTERVAL:-}"
 exit 0
 STUB
   chmod +x "$1"
@@ -104,7 +104,12 @@ S="$(mktemp -d)"
 OUT="$(run_entry "$S" \
   VAULT_1=https://example.invalid/PlanningVault.git \
   VAULT_2=https://example.invalid/PersonalVault.git \
-  VAULT_2_SYNC_ENCRYPTION_PASSWORD=two-only-secret)"
+  VAULT_2_SYNC_ENCRYPTION_PASSWORD=two-only-secret \
+  VAULT_EXCLUDE_AGENT_MEMORY=GLOBAL \
+  VAULT_LFS_CACHE_BUDGET_BYTES=GLOBAL \
+  VAULT_2_EXCLUDE_AGENT_MEMORY=1 \
+  VAULT_2_LFS_CACHE_BUDGET_BYTES=536870912 \
+  VAULT_2_LFS_CACHE_INTERVAL=300)"
 names="$(echo "$OUT" | grep -o 'LAUNCHED name=[a-z]*' | sed 's/LAUNCHED name=//' | sort | tr '\n' ',')"
 check "one bridge per VAULT_n, names derived from repo basenames" "personalvault,planningvault," "$names"
 repo_1="$(echo "$OUT" | grep 'name=planningvault' | grep -o 'repo=[^ ]*' | sed 's/repo=//')"
@@ -113,6 +118,10 @@ check "a per-vault password does not bleed to a sibling" "0" \
   "$(echo "$OUT" | grep 'name=planningvault' | grep -c 'two-only-secret')"
 check "the owning vault does receive its password" "1" \
   "$(echo "$OUT" | grep 'name=personalvault' | grep -c 'encpw=two-only-secret')"
+check "sparse exclusion reaches only its indexed owner" "1" \
+  "$(echo "$OUT" | grep 'name=personalvault' | grep -c 'sparse=1 cache=536870912 cacheinterval=300')"
+check "global footprint flags cannot leak to a sibling" "0" \
+  "$(echo "$OUT" | grep 'name=planningvault' | grep -c 'GLOBAL\|sparse=1\|cache=536870912')"
 rm -rf "$S"
 
 # --- 8. Index gaps tolerated; explicit _NAME override; precedence over files -

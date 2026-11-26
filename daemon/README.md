@@ -10,6 +10,96 @@ the one place this daemon rewrites your files.
 
 ---
 
+## Storage pressure, delivery receipts and worker footprint
+
+The worker checks free bytes **and** free inodes on both the vault and Sync-state
+filesystems before cloning, starting/restarting native Sync, or reconciling Git. It checks
+again every loop while Sync runs. Below 128 MiB or 1,024 free inodes it pauses Git writes
+and sends SIGTERM only to its own recorded native Sync child. Recovery requires 256 MiB
+and 2,048 inodes, preventing repeated starts at the reserve boundary. It resumes the same
+vault and state automatically; the storage guard never removes a Sync lock, resets
+history or deletes working files to recover space. Probe failures also block writes. These reserves are a
+headroom guard, not a reservation against other processes filling the disk between checks.
+
+An interrupted merge, cherry-pick, revert or rebase, an unmerged index, or a missing/empty
+index against a populated HEAD also pauses startup and reconciliation. The receipt names
+the recovery state. The bridge preserves the working bytes and index stages for explicit
+recovery; ordinary `git add -A` must never turn existing conflict markers or a lost index
+into a successful delivery. Known new `--no-checkout` clones initialize and verify their
+index before this normal check applies.
+
+Shutdown signals set a flag; the loop exits after a timed read/wait returns, then performs
+cleanup through EXIT. This avoids a Bash read deadline interrupting a long signal trap
+and resuming writers. Idle sleeps and cache maintenance have owned, interruptible waits.
+Bounded foreground `ob` authentication/setup calls can still defer traps in a bare shell;
+the production Docker entrypoint uses `tini -g` to forward signals to their descendants.
+
+The pinned headless client reports **any** lock-acquisition filesystem failure as
+"Another sync instance is already running", including ENOSPC. A repeated message is not
+evidence that a lock is stale or safe to remove. Check the storage receipt first.
+
+Each vault writes a private atomic JSON receipt outside the persistent data volume at
+`/tmp/vaultsync-health/<vault-name>.json` (on macOS, the physical `/private/tmp` path).
+`VAULT_HEALTH_DIR` can choose a different absolute directory outside the vault and Sync
+state; symlinked paths and directories owned by another user are refused. The directory
+is mode 0700, receipts 0600. Receipts contain state enums, counts, timestamps and Git
+hashes; no note text, paths or authenticated URLs. `status` is `blocked`, `degraded` or
+`healthy`. Explicit Git-only operation is identified by `sync_mode: git-only`; a configured
+but failed or uninitialized native transport stays degraded even when Git is working.
+
+`updated_at` proves only that the loop wrote a receipt. `last_fetch_success`,
+`last_push_success`, `last_git_reconcile_success` and `last_sync_success` are separate clocks;
+failed operations never advance them. Native startup, a live PID and error messages do
+not count as Sync progress: only an actual `Fully synced` cycle updates the native clock.
+A new native process must complete its own cycle before becoming ready. Git stage,
+commit, status, fetch, merge and push failures publish a static reason and numeric exit
+code; captured stderr is never printed because it can contain credentials. A stale or
+missing receipt needs an external observer: these local files alone cannot alert anyone
+when the container itself is stopped. Git hashes describe the last observed remote fetch,
+not proof that every device has received a particular file.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `VAULT_STORAGE_MIN_BYTES` | `134217728` | Block below this free-byte reserve. |
+| `VAULT_STORAGE_RESUME_BYTES` | `268435456` | Require this much headroom to resume. |
+| `VAULT_STORAGE_MIN_INODES` | `1024` | Block below this many free inodes. |
+| `VAULT_STORAGE_RESUME_INODES` | `2048` | Require this many inodes to resume. |
+| `VAULT_EXCLUDE_AGENT_MEMORY` | `0` | Opt in to excluding only `/.agent-memory/` from this worker checkout. |
+| `VAULT_LFS_CACHE_BUDGET_BYTES` | unset | Opt in to bounded, remotely verified LFS cache maintenance, e.g. `536870912` (512 MiB). |
+| `VAULT_LFS_CACHE_INTERVAL` | `300` | Seconds between bounded cache-maintenance attempts. |
+
+Footprint options are per vault: in indexed deployment use
+`VAULT_1_EXCLUDE_AGENT_MEMORY=1` and `VAULT_1_LFS_CACHE_BUDGET_BYTES=536870912` for the
+intended worker, using its actual configured index. Global footprint flags do not leak
+into indexed/file-mode siblings. Shared storage reserves and health-directory settings
+apply globally unless a vault's own secret file overrides them.
+
+The sparse option retains the complete Git index, history and origin, so `git add -A`,
+fast-forwards and ordinary divergent merges retain the excluded bytes. New clones use
+`--no-checkout`, configure the exclusion and initialize the sparse index **before** any
+checkout can materialize the large directory. Existing clean copies can be omitted.
+Dirty, untracked or ignored bytes inside that directory, and any different existing
+sparse policy, cause refusal with all bytes retained. Visible notes and `.obsidian/`
+remain materialized. Enable it only on a bridge worker that has no consumer of this
+Git-only bookkeeping; it is not a policy for an owner's working vault.
+
+The cache helper is independently callable in default dry-run mode:
+
+```bash
+node /app/cache-maintenance.mjs --repo-dir /data/vaults/example \
+  --budget-bytes 536870912 --target-free-bytes 268435456
+```
+
+Add `--apply` only for the reviewed eviction. The helper verifies remote download
+availability and local object identity before evicting derived `.git/lfs/objects` cache
+entries. It does not delete working notes, remote objects or Git history. Maintenance
+has explicit time/object/byte limits; insufficient verified cache space remains a
+blocked state requiring a capacity change rather than a destructive cleanup. Automatic
+maintenance runs before the storage wait so an already full disk can regain headroom,
+and periodically thereafter. It uses the existing authenticated origin privately.
+
+---
+
 ## Two transports move a bridged vault, and only one carries `.obsidian/`
 
 This is the single most confusing thing about a bridged vault, and it cost a full day before

@@ -165,6 +165,8 @@ DEVICE_NAME="${VAULT_DEVICE_NAME:-vault-bridge-$NAME}"
 GIT_NAME="${GIT_AUTHOR_NAME:-vault-bridge}"
 GIT_EMAIL="${GIT_AUTHOR_EMAIL:-vault-bridge@localhost}"
 OB_PID=""
+SHUTDOWN_REQUESTED=0
+PAUSE_PID=""
 
 # Adaptive remote polling. A legacy VAULT_BRIDGE_INTERVAL pins both rates to
 # one fixed value, reproducing the old fixed-15s (or test-overridden) loop.
@@ -186,6 +188,298 @@ MAX_FILE_MB="${VAULT_MAX_FILE_MB:-5}"
 
 log() { printf '[vault-bridge:%s] %s\n' "$NAME" "$*" >&2; }
 
+# The headless client's lock-acquire handler calls EVERY filesystem error
+# "Another sync instance" (including ENOSPC). Check capacity before asking it
+# to write. Hysteresis prevents sibling vaults sharing a disk from oscillating
+# between starting and stopping at the same reserve boundary. Nothing here
+# deletes files, unlocks a vault, or resets its history.
+STORAGE_MIN_BYTES="${VAULT_STORAGE_MIN_BYTES:-134217728}"
+STORAGE_RESUME_BYTES="${VAULT_STORAGE_RESUME_BYTES:-268435456}"
+STORAGE_MIN_INODES="${VAULT_STORAGE_MIN_INODES:-1024}"
+STORAGE_RESUME_INODES="${VAULT_STORAGE_RESUME_INODES:-2048}"
+for storage_number in "$STORAGE_MIN_BYTES" "$STORAGE_RESUME_BYTES" "$STORAGE_MIN_INODES" "$STORAGE_RESUME_INODES"; do
+  case "$storage_number" in ''|*[!0-9]*) log 'FATAL: storage reserves must be unsigned integers'; exit 1;; esac
+done
+if [ "$STORAGE_RESUME_BYTES" -lt "$STORAGE_MIN_BYTES" ] || [ "$STORAGE_RESUME_INODES" -lt "$STORAGE_MIN_INODES" ]; then
+  log 'FATAL: storage recovery reserves must be at least the blocking reserves'; exit 1
+fi
+STORAGE_BLOCKED=0; STORAGE_REASON=unchecked; STORAGE_BYTES=0; STORAGE_INODES=0
+GIT_STATE=pending; GIT_REASON=not_checked; LAST_GIT_RC=0
+LAST_FETCH_SUCCESS=0; LAST_PUSH_SUCCESS=0; LAST_RECONCILE_SUCCESS=0
+SYNC_MODE=git-only; SYNC_STATE=disabled; OB_STARTED_AT=0; OB_GENERATION=0; OB_RUN_ID=none
+[ -z "$SYNC_REMOTE" ] || { SYNC_MODE=configured; SYNC_STATE=not_ready; }
+HEALTH_KEY="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9_-' '_')"
+HEALTH_DIR="${VAULT_HEALTH_DIR:-$(cd /tmp && pwd -P)/vaultsync-health}"
+# A health receipt must remain writable when /data fills and cannot enter the
+# vault. Refuse a symlink anywhere in its path, including an existing leaf.
+case "$HEALTH_DIR" in /*) ;; *) log 'FATAL: VAULT_HEALTH_DIR must be absolute'; exit 1;; esac
+case "$HEALTH_DIR/" in */../*|*/./*|//*|/|/tmp/|/private/tmp/|/data/) log 'FATAL: health directory must be a dedicated literal path'; exit 1;; esac
+case "$HEALTH_DIR/" in "$VAULT_DIR/"*|"${XDG_CONFIG_HOME:-/data/ob-state}/"*) log 'FATAL: health directory must be outside vault and Sync state'; exit 1;; esac
+health_parent="$HEALTH_DIR"
+while [ "$health_parent" != / ]; do
+  [ ! -L "$health_parent" ] || { log 'FATAL: health directory has a symlink component'; exit 1; }
+  health_parent="$(dirname "$health_parent")"
+done
+if ! (umask 077; mkdir -p "$HEALTH_DIR") || [ ! -O "$HEALTH_DIR" ]; then
+  log 'FATAL: health directory is not writable and owned by this worker'; exit 1
+fi
+chmod 700 "$HEALTH_DIR" || exit 1
+HEALTH_FILE="$HEALTH_DIR/$HEALTH_KEY.json"
+OB_ACTIVITY_FILE="$HEALTH_DIR/$HEALTH_KEY.sync-progress"
+OB_SUCCESS_FILE="$HEALTH_DIR/$HEALTH_KEY.sync-success"
+OB_STATUS_FILE="$HEALTH_DIR/$HEALTH_KEY.sync-status"
+GIT_ERROR_FILE="$HEALTH_DIR/.$HEALTH_KEY.git-error-$$"
+for health_path in "$HEALTH_FILE" "$OB_ACTIVITY_FILE" "$OB_SUCCESS_FILE" "$OB_STATUS_FILE" "$GIT_ERROR_FILE"; do
+  [ ! -L "$health_path" ] || { log 'FATAL: health artifact is a symlink'; exit 1; }
+done
+(umask 077; : > "$GIT_ERROR_FILE") || { log 'FATAL: cannot create private Git diagnostic scratch'; exit 1; }
+# Read only our numeric clock fields, never source/eval a previous receipt.
+health_clock() {
+  local value
+  value="$(sed -n 's/^  "'"$1"'": \([0-9][0-9]*\),\{0,1\}$/\1/p' "$HEALTH_FILE" 2>/dev/null | head -1)"
+  printf '%s' "${value:-0}"
+}
+LAST_FETCH_SUCCESS="$(health_clock last_fetch_success)"
+LAST_PUSH_SUCCESS="$(health_clock last_push_success)"
+LAST_RECONCILE_SUCCESS="$(health_clock last_git_reconcile_success)"
+sync_clock() {
+  local value=0 ignored
+  [ ! -f "$1" ] || read -r value ignored < "$1"
+  case "$value" in ''|*[!0-9]*) value=0;; esac
+  printf '%s' "$value"
+}
+sync_marker() {
+  local tmp
+  tmp="$(umask 077; mktemp "$HEALTH_DIR/.$HEALTH_KEY.sync.XXXXXX")" || return 1
+  if ! printf '%s\n' "$2" > "$tmp" || ! mv -f "$tmp" "$1"; then rm -f "$tmp"; return 1; fi
+}
+health_write() {
+  local status=degraded reason="$GIT_REASON" tmp now progress synced sync_state="$SYNC_STATE" event_run="" event_state="" head remote_head
+  now="$(date +%s)"; progress="$(sync_clock "$OB_ACTIVITY_FILE")"; synced="$(sync_clock "$OB_SUCCESS_FILE")"
+  [ ! -f "$OB_STATUS_FILE" ] || read -r event_run event_state < "$OB_STATUS_FILE"
+  if [ "$SYNC_MODE" = configured ] && [ "$SYNC_STATE" = starting ] && [ "$event_run" = "$OB_RUN_ID" ]; then
+    case "$event_state" in ready|error) sync_state="$event_state";; esac
+  fi
+  if [ "$SYNC_MODE" = configured ] && ! owned_ob_running; then sync_state=not_ready; fi
+  if [ "$STORAGE_BLOCKED" -eq 1 ]; then status=blocked; reason="storage_$STORAGE_REASON"
+  elif [ "$GIT_STATE" = ok ]; then
+    if [ "$SYNC_MODE" = git-only ] || [ "$sync_state" = ready ]; then status=healthy; reason=ok
+    elif [ "$sync_state" = error ]; then reason=sync_failed
+    else reason=sync_not_ready; fi
+  fi
+  if [ "$SYNC_MODE" = configured ] && [ "$sync_state" = ready ] && [ "${OB_SILENCE_WARN:-5400}" -gt 0 ] && [ $((now-progress)) -ge "${OB_SILENCE_WARN:-5400}" ]; then
+    [ "$status" = blocked ] || { status=degraded; reason=sync_no_progress; }; sync_state=stalled
+  fi
+  head="$(git -C "$VAULT_DIR" rev-parse HEAD 2>/dev/null || true)"
+  remote_head="$(git -C "$VAULT_DIR" rev-parse "refs/remotes/origin/$VAULT_BRANCH" 2>/dev/null || true)"
+  case "$head" in *[!0-9a-f]*) head="";; esac
+  case "$remote_head" in *[!0-9a-f]*) remote_head="";; esac
+  tmp="$(umask 077; mktemp "$HEALTH_DIR/.$HEALTH_KEY.XXXXXX")" || { log 'WARNING: health receipt cannot be written'; return 1; }
+  if ! {
+    printf '{\n  "schema": 1,\n  "status": "%s",\n  "reason": "%s",\n' "$status" "$reason"
+    printf '  "updated_at": %s,\n  "storage_state": "%s",\n  "storage_reason": "%s",\n' "$now" "$([ "$STORAGE_BLOCKED" -eq 1 ] && echo blocked || echo ready)" "$STORAGE_REASON"
+    printf '  "available_bytes": %s,\n  "free_inodes": %s,\n' "$STORAGE_BYTES" "$STORAGE_INODES"
+    printf '  "cache_cursor": %s,\n' "$LFS_CACHE_CURSOR"
+    printf '  "sync_mode": "%s",\n  "sync_state": "%s",\n' "$SYNC_MODE" "$sync_state"
+    printf '  "git_state": "%s",\n  "git_reason": "%s",\n  "last_git_rc": %s,\n' "$GIT_STATE" "$GIT_REASON" "$LAST_GIT_RC"
+    printf '  "head": "%s",\n  "remote_head": "%s",\n' "$head" "$remote_head"
+    printf '  "last_fetch_success": %s,\n  "last_push_success": %s,\n  "last_git_reconcile_success": %s,\n' "$LAST_FETCH_SUCCESS" "$LAST_PUSH_SUCCESS" "$LAST_RECONCILE_SUCCESS"
+    printf '  "last_sync_progress": %s,\n  "last_sync_success": %s\n}\n' "$progress" "$synced"
+  } > "$tmp" || ! mv -f "$tmp" "$HEALTH_FILE"; then
+    rm -f "$tmp"; log 'WARNING: health receipt cannot be written'; return 1
+  fi
+}
+storage_sample() {
+  local path="$1" bytes inodes
+  while [ ! -e "$path" ] && [ "$path" != / ]; do path="$(dirname "$path")"; done
+  bytes="$(LC_ALL=C df -Pk "$path" 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="Available"||$i=="Avail") col=i} NR==2&&col {printf "%.0f",$col*1024}')"
+  inodes="$(LC_ALL=C df -Pi "$path" 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="IFree"||$i=="IAvail"||$i=="ifree") col=i} NR==2&&col {printf "%.0f",$col}')"
+  case "$bytes:$inodes" in *[!0-9:]*|:*|*:) return 1;; esac
+  [ "$bytes" -ge "$STORAGE_BYTES" ] || STORAGE_BYTES="$bytes"
+  [ "$inodes" -ge "$STORAGE_INODES" ] || STORAGE_INODES="$inodes"
+}
+storage_check() {
+  local old="$STORAGE_BLOCKED:$STORAGE_REASON" min_bytes="$STORAGE_MIN_BYTES" min_inodes="$STORAGE_MIN_INODES"
+  STORAGE_BYTES=9223372036854775807; STORAGE_INODES=9223372036854775807
+  [ "$STORAGE_BLOCKED" -eq 0 ] || { min_bytes="$STORAGE_RESUME_BYTES"; min_inodes="$STORAGE_RESUME_INODES"; }
+  if ! storage_sample "$VAULT_DIR" || ! storage_sample "${XDG_CONFIG_HOME:-/data/ob-state}"; then
+    STORAGE_BLOCKED=1; STORAGE_REASON=probe_failed; STORAGE_BYTES=0; STORAGE_INODES=0
+  elif [ "$STORAGE_BYTES" -lt "$min_bytes" ]; then STORAGE_BLOCKED=1; STORAGE_REASON=bytes
+  elif [ "$STORAGE_INODES" -lt "$min_inodes" ]; then STORAGE_BLOCKED=1; STORAGE_REASON=inodes
+  else STORAGE_BLOCKED=0; STORAGE_REASON=ok; fi
+  if [ "$old" != "$STORAGE_BLOCKED:$STORAGE_REASON" ]; then
+    if [ "$STORAGE_BLOCKED" -eq 1 ]; then
+      log "STORAGE BLOCKED: reason=$STORAGE_REASON available_bytes=$STORAGE_BYTES free_inodes=$STORAGE_INODES; Sync and Git writes paused, no files removed."
+    else log "storage recovered: available_bytes=$STORAGE_BYTES free_inodes=$STORAGE_INODES; resuming retained vault state."; fi
+  fi
+  [ "$STORAGE_BLOCKED" -eq 0 ]
+}
+# jobs -pr is this shell's own child table. A stale/reused numeric PID never
+# authorizes a signal to a process belonging to another worker or vault.
+owned_ob_running() { [ -n "$OB_PID" ] && jobs -pr | grep -Fxq "$OB_PID"; }
+stop_owned_ob() {
+  local n=0
+  if owned_ob_running; then
+    kill -TERM "$OB_PID" 2>/dev/null || true
+    while owned_ob_running && [ "$n" -lt 25 ]; do sleep .2; n=$((n+1)); done
+    if owned_ob_running; then SYNC_STATE=stop_pending; log 'WARNING: owned Sync child has not finished graceful shutdown'; return 1; fi
+  fi
+  [ -z "$OB_PID" ] || wait "$OB_PID" 2>/dev/null || true
+  OB_PID=""; [ "$SYNC_MODE" != configured ] || SYNC_STATE=stopped
+}
+storage_wait() {
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
+  while ! storage_check; do
+    stop_owned_ob || true
+    health_write || true
+    cache_maintenance
+    storage_check && break
+    bridge_pause "$POLL_IDLE"
+  done
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
+  health_write || true
+}
+# wait is interruptible; a foreground sleep otherwise delays a requested stop
+# until the entire idle interval has elapsed.
+bridge_pause() {
+  sleep "$1" & PAUSE_PID=$!
+  wait "$PAUSE_PID" 2>/dev/null || true
+  if [ "$SHUTDOWN_REQUESTED" -ne 0 ]; then
+    kill -TERM "$PAUSE_PID" 2>/dev/null || true
+    wait "$PAUSE_PID" 2>/dev/null || true
+    PAUSE_PID=""; exit 0
+  fi
+  PAUSE_PID=""
+}
+git_failure() {
+  GIT_STATE=failed; GIT_REASON="${1}_failed"; LAST_GIT_RC="$2"
+  log "WARNING: git $1 failed rc=$2; retained local state; retrying after preflight."
+  if grep -Eqi 'no space left|ENOSPC|disk full' "$GIT_ERROR_FILE" 2>/dev/null; then
+    STORAGE_BLOCKED=1; STORAGE_REASON=write_enospc
+    log 'STORAGE BLOCKED: Git reported ENOSPC; no lock removal or file deletion attempted.'
+    stop_owned_ob || true
+  fi
+  health_write || true
+}
+
+# A redeploy can interrupt a merge after Git has written conflict stages but
+# before our resolver finishes. Never let the ordinary add-A path certify those
+# marker bytes as a resolution, or treat a lost index as intentional deletions.
+# Leave every byte/stage in place for explicit recovery, without abort/reset.
+GIT_OPERATION_WARNED=""
+git_worktree_ready() {
+  local operation reason="" unmerged rc head_paths
+  for operation in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do
+    [ ! -e "$VAULT_DIR/.git/$operation" ] || reason=git_operation_in_progress
+  done
+  unmerged="$(git -C "$VAULT_DIR" ls-files --unmerged 2>"$GIT_ERROR_FILE")"; rc=$?
+  if [ "$rc" -ne 0 ]; then git_failure index "$rc"; return 1; fi
+  [ -z "$unmerged" ] || reason=git_operation_in_progress
+  if [ -z "$reason" ] && [ "${1:-0}" != 1 ]; then
+    git -C "$VAULT_DIR" ls-files --error-unmatch '*' >/dev/null 2>"$GIT_ERROR_FILE"; rc=$?
+    if [ "$rc" -eq 1 ]; then
+      head_paths="$(git -C "$VAULT_DIR" ls-tree -r --name-only HEAD 2>"$GIT_ERROR_FILE")"; rc=$?
+      if [ "$rc" -ne 0 ]; then git_failure index "$rc"; return 1; fi
+      [ -z "$head_paths" ] || reason=git_index_incomplete
+    elif [ "$rc" -ne 0 ]; then git_failure index "$rc"; return 1; fi
+  fi
+  if [ -n "$reason" ]; then
+    GIT_STATE=held; GIT_REASON="$reason"; LAST_GIT_RC=0
+    if [ "$GIT_OPERATION_WARNED" != "$reason" ]; then
+      log "WARNING: $reason; Sync and Git writes paused, index and working bytes retained for explicit recovery."
+      GIT_OPERATION_WARNED="$reason"
+    fi
+    health_write || true; return 1
+  fi
+  GIT_OPERATION_WARNED=""
+}
+
+# Worker-only footprint policy. The repository/index/history keep every byte;
+# only a clean, derived checkout of this exact Git-only directory is omitted.
+# Existing sparse policies and any dirty/untracked/ignored content are refused
+# rather than replaced. This runs before an initial checkout, not after it.
+EXCLUDE_AGENT_MEMORY="${VAULT_EXCLUDE_AGENT_MEMORY:-0}"
+configure_worker_sparse() {
+  case "$EXCLUDE_AGENT_MEMORY" in 1|true|yes) ;; *) return 0;; esac
+  local dirty patterns
+  if [ "${1:-0}" = 1 ]; then
+    # A successful --no-checkout clone has no index/worktree yet; status would
+    # call its intentionally absent files deletions. An unexpected local tree
+    # here is never ours to remove, even during this first checkout.
+    dirty=""; [ ! -e "$VAULT_DIR/.agent-memory" ] || dirty=present
+  else
+    dirty="$(git -C "$VAULT_DIR" status --porcelain --ignored --untracked-files=all -- .agent-memory 2>"$GIT_ERROR_FILE")" || return 1
+  fi
+  if [ -n "$dirty" ]; then
+    log 'FATAL: worker sparse exclusion refused: .agent-memory has dirty, untracked, or ignored files; all retained.'
+    GIT_STATE=failed; GIT_REASON=sparse_dirty; health_write || true; return 1
+  fi
+  if [ "$(git -C "$VAULT_DIR" config --bool core.sparseCheckout 2>/dev/null || true)" = true ]; then
+    patterns="$(git -C "$VAULT_DIR" rev-parse --git-path info/sparse-checkout)"
+    case "$patterns" in /*) ;; *) patterns="$VAULT_DIR/$patterns";; esac
+    if [ "$(cat "$patterns" 2>/dev/null)" != $'/*\n!/.agent-memory/' ]; then
+      log 'FATAL: worker sparse exclusion refused: a different sparse policy already exists.'
+      GIT_STATE=failed; GIT_REASON=sparse_policy_conflict; health_write || true; return 1
+    fi
+  fi
+  if ! printf '/*\n!/.agent-memory/\n' | git -C "$VAULT_DIR" sparse-checkout set --no-cone --stdin >/dev/null 2>"$GIT_ERROR_FILE"; then
+    log 'FATAL: worker sparse exclusion failed; no history or source deletion attempted.'
+    GIT_STATE=failed; GIT_REASON=sparse_failed; health_write || true; return 1
+  fi
+  if [ "${1:-0}" = 1 ]; then
+    # sparse-checkout set configures the pattern but an initial --no-checkout
+    # clone can still have an EMPTY index. Populate it through the sparse-aware
+    # read-tree before add-A can ever interpret missing entries as deletions.
+    if ! git -C "$VAULT_DIR" read-tree -mu HEAD 2>"$GIT_ERROR_FILE" ||
+       ! git -C "$VAULT_DIR" diff --cached --quiet HEAD; then
+      log 'FATAL: initial sparse checkout/index verification failed; reconciliation refused.'
+      GIT_STATE=failed; GIT_REASON=sparse_initial_checkout_failed; health_write || true; return 1
+    fi
+  fi
+  log 'worker checkout excludes clean /.agent-memory/; index, history, origin and visible Sync files retained.'
+}
+
+# Optional bounded verified LFS-cache maintenance. The helper only evicts
+# remotely confirmed derived cache objects, never tracked/working-tree files.
+# Run before the storage wait so a full disk can recover without a restart.
+LFS_CACHE_BUDGET="${VAULT_LFS_CACHE_BUDGET_BYTES:-}"
+LFS_CACHE_INTERVAL="${VAULT_LFS_CACHE_INTERVAL:-300}"
+LFS_CACHE_AFTER=0
+LFS_CACHE_CURSOR="$(health_clock cache_cursor)"
+cache_cursor() {
+  case "$1" in ''|*[!0-9]*) printf 0; return;; esac
+  if [ "${#1}" -gt 16 ] || [ "$1" -gt 9007199254740991 ]; then printf 0; else printf '%s' "$1"; fi
+}
+LFS_CACHE_CURSOR="$(cache_cursor "$LFS_CACHE_CURSOR")"
+CACHE_PID=""
+CACHE_RECEIPT="$HEALTH_DIR/.$HEALTH_KEY.cache-receipt-$$"
+[ ! -L "$CACHE_RECEIPT" ] || { log 'FATAL: cache receipt is a symlink'; exit 1; }
+CACHE_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cache-maintenance.mjs"
+cache_maintenance() {
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
+  [ -n "$LFS_CACHE_BUDGET" ] && [ -d "$VAULT_DIR/.git" ] || return 0
+  local now result rc
+  now="$(date +%s)"
+  [ "$now" -ge "$LFS_CACHE_AFTER" ] || return 0
+  LFS_CACHE_AFTER=$((now+LFS_CACHE_INTERVAL))
+  (umask 077; : > "$CACHE_RECEIPT") || { log 'WARNING: cache receipt unavailable'; return 1; }
+  node "$CACHE_HELPER" --repo-dir "$VAULT_DIR" --budget-bytes "$LFS_CACHE_BUDGET" --target-free-bytes "$STORAGE_RESUME_BYTES" --max-bytes 2147483648 --max-objects 1024 --max-seconds 120 --cursor "$LFS_CACHE_CURSOR" --apply >"$CACHE_RECEIPT" 2>/dev/null &
+  CACHE_PID=$!
+  wait "$CACHE_PID"; rc=$?
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
+  CACHE_PID=""
+  result="$(cat "$CACHE_RECEIPT")"; rm -f "$CACHE_RECEIPT"
+  LFS_CACHE_CURSOR="$(cache_cursor "$(printf '%s' "$result" | sed -n 's/.*"nextCursor"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*[,}].*/\1/p')")"
+  # Only the helper's structured, sanitized receipt is logged, never stderr
+  # (Git credential helpers and HTTP errors may contain authenticated URLs).
+  log "LFS cache maintenance rc=$rc receipt=$result"
+}
+if [ -n "$LFS_CACHE_BUDGET" ]; then
+  case "$LFS_CACHE_BUDGET:$LFS_CACHE_INTERVAL" in *[!0-9:]*|:*|*:) log 'FATAL: LFS cache budget/interval must be unsigned integers'; exit 1;; esac
+  [ "$LFS_CACHE_INTERVAL" -gt 0 ] || { log 'FATAL: LFS cache interval must be positive'; exit 1; }
+  command -v node >/dev/null 2>&1 && [ -f "$CACHE_HELPER" ] || { log 'FATAL: configured LFS cache maintenance helper is unavailable'; exit 1; }
+fi
+
 # `ob` must never inherit a TTY or a readable stdin: a prompt in a background
 # worker hangs forever and is invisible. Fail fast instead. Every ob call is also
 # time-bounded. Without this a network stall in sync-setup hung the
@@ -200,30 +494,38 @@ INOTIFY_PID=""
 FIFO=""
 
 cleanup() {
-  if [ -n "$OB_PID" ] && kill -0 "$OB_PID" 2>/dev/null; then
-    kill "$OB_PID" 2>/dev/null || true
-    wait "$OB_PID" 2>/dev/null || true
+  stop_owned_ob || true
+  if [ -n "$CACHE_PID" ] && jobs -pr | grep -Fxq "$CACHE_PID"; then
+    kill -TERM "$CACHE_PID" 2>/dev/null || true
+    wait "$CACHE_PID" 2>/dev/null || true
+  fi
+  if [ -n "$PAUSE_PID" ] && jobs -pr | grep -Fxq "$PAUSE_PID"; then
+    kill -TERM "$PAUSE_PID" 2>/dev/null || true
+    wait "$PAUSE_PID" 2>/dev/null || true
   fi
   if [ -n "$INOTIFY_PID" ] && kill -0 "$INOTIFY_PID" 2>/dev/null; then
     kill "$INOTIFY_PID" 2>/dev/null || true
     wait "$INOTIFY_PID" 2>/dev/null || true
   fi
+  if [ "$GIT_STATE" = ok ] || [ "$GIT_STATE" = pending ]; then GIT_STATE=stopped; GIT_REASON=worker_stopped; fi
+  health_write || true
   exec 3<&- 2>/dev/null || true
   [ -n "$FIFO" ] && rm -f "$FIFO" 2>/dev/null || true
+  rm -f "$GIT_ERROR_FILE" 2>/dev/null || true
+  rm -f "$CACHE_RECEIPT" 2>/dev/null || true
 }
-# INT/TERM must actually terminate the process, not just run cleanup and let
-# the infinite reconcile loop resume - bash does NOT exit a trapped signal by
-# default, so without the explicit `exit` a redeploy's kill would leave the
-# bridge running past its supervisor's expectations. EXIT covers normal/error
-# returns; cleanup() is idempotent so running it twice (TERM's handler, then
-# the EXIT trap it triggers) is harmless.
+# EXIT covers normal/error returns and the shutdown flag checks below. Cleanup
+# remains idempotent, but never runs inside a timed read's signal handler.
 trap cleanup EXIT
-trap 'cleanup; exit 0' INT TERM
+# A timed read's deadline can interrupt a long signal trap in Bash, abandoning
+# cleanup before its final exit and resuming the main loop. Set only a flag in
+# the handler. Exit AFTER read/wait returns; EXIT then owns the full cleanup.
+trap 'SHUTDOWN_REQUESTED=1' INT TERM
 
 # --- 0. Unconfigured => idle without error -----------------------------------
 if [ -z "$VAULT_REPO" ]; then
   log "VAULT_REPO unset - bridge idle. Configure it to enable. No-op."
-  while true; do sleep 3600; done
+  while true; do bridge_pause 3600; done
 fi
 
 # A tokenless https VAULT_REPO + a global GIT_TOKEN compose into an
@@ -252,6 +554,10 @@ if printf '%s' "${VAULT_REPO} ${GIT_TOKEN:-} ${SYNC_ENC_PW} ${OBSIDIAN_AUTH_TOKE
 fi
 
 command -v git >/dev/null 2>&1 || { log "FATAL: git not installed"; exit 1; }
+# Includes initial clone/checkout: do not wait until a partial checkout has
+# already consumed the last writable bytes on the persistent volume.
+cache_maintenance
+storage_wait
 HAVE_LFS=0
 if command -v git-lfs >/dev/null 2>&1; then
   HAVE_LFS=1
@@ -274,6 +580,7 @@ if [ -d "$VAULT_DIR/.git" ] && ! git -C "$VAULT_DIR" rev-parse --git-dir >/dev/n
   log "       every operation would fail silently. Delete the directory to re-clone."
   exit 1
 fi
+INITIAL_CHECKOUT=0
 if [ ! -d "$VAULT_DIR/.git" ]; then
   log "cloning vault -> $VAULT_DIR (branch $VAULT_BRANCH)"
   if ! mkdir -p "$(dirname "$VAULT_DIR")" 2>/dev/null; then
@@ -283,7 +590,9 @@ if [ ! -d "$VAULT_DIR/.git" ]; then
   # Capture git's own stderr instead of discarding it. The generic guess-list
   # below is useful, but "Remote branch main not found" or "No space left on
   # device" is the actual answer, and it was being thrown away.
-  clone_err="$(git clone --branch "$VAULT_BRANCH" "$VAULT_REPO" "$VAULT_DIR" 2>&1 >/dev/null)" || {
+  clone_args=(--branch "$VAULT_BRANCH")
+  case "$EXCLUDE_AGENT_MEMORY" in 1|true|yes) clone_args+=(--no-checkout); INITIAL_CHECKOUT=1;; esac
+  clone_err="$(git clone "${clone_args[@]}" "$VAULT_REPO" "$VAULT_DIR" 2>&1 >/dev/null)" || {
     # Never echo the URL: it carries the token. Strip anything before '@'.
     log "FATAL: clone failed. Not retrying blindly. git said:"
     printf '%s\n' "$clone_err" | sed 's#https://[^@]*@#https://***@#g' | while IFS= read -r l; do
@@ -296,6 +605,11 @@ if [ ! -d "$VAULT_DIR/.git" ]; then
     exit 1
   }
 fi
+storage_wait
+git_worktree_ready "$INITIAL_CHECKOUT" || exit 1
+configure_worker_sparse "$INITIAL_CHECKOUT" || exit 1
+git_worktree_ready || exit 1
+cache_maintenance
 # A vault that declares LFS filters but has no git-lfs binary does not fail — git
 # commits the raw pointer files as if they were the media. That is silent data
 # corruption discovered only when someone opens a broken image, so refuse instead.
@@ -384,7 +698,7 @@ apply_sync_config() {
 ensure_ob_setup() {
   if ob_q sync-status --path "$VAULT_DIR"; then
     apply_sync_config   # re-assert on every boot; heals an older linked vault
-    return 0   # already linked
+    return $?   # already linked, but a rejected config is not a ready Sync
   fi
   if [ -z "$SYNC_REMOTE" ]; then
     log "WARNING: VAULT_SYNC_REMOTE unset - cannot link Sync; device sync disabled."
@@ -404,7 +718,7 @@ ensure_ob_setup() {
     return 1
   fi
   apply_sync_config
-  return 0
+  return $?
 }
 
 # OB_PID is the real `ob` process, backgrounded directly - the same rule as
@@ -414,22 +728,28 @@ ensure_ob_setup() {
 # situation this daemon exists to prevent. Restart-on-death happens inline in
 # the main loop (rate-limited), never via a wrapper.
 HAVE_OB=0
-# `ob sync --continuous` narrates its own work ("Connecting", "Detecting
-# changes", "Fully synced"). That stream was prefixed and discarded, which is
-# why an ob that stayed ALIVE but stopped syncing was undetectable: kill -0 only
-# proves the process exists. Stamping a marker on every line it emits turns its
-# own narration into a liveness signal - the closest thing to a heartbeat the
-# client offers, since there is no health API to ask.
-#
-# The marker lives beside the sync state, NEVER inside VAULT_DIR: a file in the
-# vault would be committed and synced to every device.
-OB_ACTIVITY_FILE="${XDG_CONFIG_HOME:-/tmp}/ob-activity-$NAME"
+# Only a completed Sync cycle counts as progress. Startup text and repeated
+# errors must not refresh this clock or conceal a broken native transport.
 start_ob_continuous() {
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
+  storage_check || { health_write || true; return 1; }
+  OB_STARTED_AT="$(date +%s)"; OB_GENERATION=$((OB_GENERATION+1))
+  OB_RUN_ID="$$-$OB_STARTED_AT-$OB_GENERATION"
+  SYNC_MODE=configured; SYNC_STATE=starting
   log "starting: ob sync --continuous --path $VAULT_DIR"
-  touch "$OB_ACTIVITY_FILE" 2>/dev/null || true
   ob sync --continuous --path "$VAULT_DIR" </dev/null \
     > >(while IFS= read -r _ob_line; do
-          touch "$OB_ACTIVITY_FILE" 2>/dev/null || true
+          case "$_ob_line" in
+            'Fully synced'|*'] Fully synced')
+              _ob_now="$(date +%s)"
+              sync_marker "$OB_ACTIVITY_FILE" "$_ob_now"
+              sync_marker "$OB_SUCCESS_FILE" "$_ob_now"
+              sync_marker "$OB_STATUS_FILE" "$OB_RUN_ID ready"
+              ;;
+            'Sync error:'*|'Sync failed:'*|'Another sync instance is already running for this vault.'|'Disconnected from server'|*'] Sync error:'*|*'] Sync failed:'*|*'] Another sync instance is already running for this vault.'|*'] Disconnected from server')
+              sync_marker "$OB_STATUS_FILE" "$OB_RUN_ID error"
+              ;;
+          esac
           printf '[ob:%s] %s\n' "$NAME" "$_ob_line" >&2
         done) 2>&1 &
   OB_PID=$!
@@ -440,15 +760,16 @@ start_ob_continuous() {
 # above the observed gap rather than at it. 0 disables the check.
 OB_SILENCE_WARN="${VAULT_OB_SILENCE_WARN:-5400}"
 ob_silence_secs() {
-  [ -f "$OB_ACTIVITY_FILE" ] || { printf 'unknown'; return; }
   local last now
-  last="$(stat -c %Y "$OB_ACTIVITY_FILE" 2>/dev/null || echo 0)"
+  last="$(sync_clock "$OB_ACTIVITY_FILE")"
+  [ "$last" -gt "$OB_STARTED_AT" ] || last="$OB_STARTED_AT"
+  [ "$last" -gt 0 ] || { printf unknown; return; }
   now="$(date +%s)"
   printf '%s' "$(( now - last ))"
 }
 
 if command -v ob >/dev/null 2>&1; then
-  if ensure_ob_auth && ensure_ob_setup; then
+  if storage_check && ensure_ob_auth && ensure_ob_setup; then
     HAVE_OB=1
     start_ob_continuous
   else
@@ -1021,63 +1342,68 @@ LAST_HEARTBEAT=0
 
 RECONCILE_ACTIVITY=0
 reconcile_pass() {
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
   RECONCILE_ACTIVITY=0
-  local before_rev after_rev
+  local before_rev after_rev dirty rc
+  if ! storage_check; then stop_owned_ob || true; health_write || true; return; fi
+  if ! git_worktree_ready; then stop_owned_ob || true; health_write || true; return; fi
+  GIT_STATE=pending; GIT_REASON=reconciling; LAST_GIT_RC=0
+  dirty="$(git -C "$VAULT_DIR" status --porcelain 2>"$GIT_ERROR_FILE")"; rc=$?
+  if [ "$rc" -ne 0 ]; then git_failure status "$rc"; return; fi
 
-  # 1. Commit local changes FIRST. Device edits enter history before any merge
-  #    can touch the tree, so no sequence of later steps can lose them - and
-  #    `git merge` refuses a dirty tree anyway.
-  if [ -n "$(git -C "$VAULT_DIR" status --porcelain 2>/dev/null || true)" ]; then
-    git -C "$VAULT_DIR" add -A 2>/dev/null || true
+  # Device bytes enter history before a merge can touch the working tree.
+  if [ -n "$dirty" ]; then
+    storage_check || { health_write || true; return; }
+    git -C "$VAULT_DIR" add -A 2>"$GIT_ERROR_FILE"; rc=$?
+    if [ "$rc" -ne 0 ]; then git_failure stage "$rc"; return; fi
     enforce_size_cap
     if ! guard_mass_deletion; then
-      # The tree lost more than the allowed share of its notes. Refuse the whole
-      # pass rather than committing it: unstage and leave the working tree
-      # untouched, so the next pass re-evaluates. Nothing is deleted from git.
       git -C "$VAULT_DIR" reset -q 2>/dev/null || true
-      return 0
+      GIT_STATE=held; GIT_REASON=deletion_held; health_write || true; return
     fi
     if ! git -C "$VAULT_DIR" diff --cached --quiet 2>/dev/null; then
-      if git -C "$VAULT_DIR" commit -q -m "vault sync: $(date -u +%FT%TZ)" 2>/dev/null; then
+      storage_check || { health_write || true; return; }
+      if git -C "$VAULT_DIR" commit -q -m "vault sync: $(date -u +%FT%TZ)" 2>"$GIT_ERROR_FILE"; then
         RECONCILE_ACTIVITY=1
       else
-        # Every other failure in this loop logs; this one used to be silent, so a
-        # full disk (the likeliest cause, and one a sibling vault can inflict on
-        # a shared volume) looked exactly like a healthy idle daemon.
-        # Log the first failure, then rarely: this fires once per poll while the
-        # underlying condition lasts, and unbounded spam buries the message that
-        # matters.
-        COMMIT_FAIL_COUNT=$(( COMMIT_FAIL_COUNT + 1 ))
-        if [ "$COMMIT_FAIL_COUNT" -eq 1 ] || [ $(( COMMIT_FAIL_COUNT % 60 )) -eq 0 ]; then
-          log "WARNING: commit failed (x${COMMIT_FAIL_COUNT}) - changes remain uncommitted (disk full? index lock?)."
-        fi
+        rc=$?; COMMIT_FAIL_COUNT=$((COMMIT_FAIL_COUNT+1))
+        git_failure commit "$rc"; return
       fi
     fi
   fi
 
-  # 2. Fetch, then reconcile with the remote: fast-forward when possible, a
-  #    real merge when diverged (matching Sync's own auto-merge semantics),
-  #    Sync-style conflicted copies when the merge genuinely collides.
   before_rev="$(git -C "$VAULT_DIR" rev-parse HEAD 2>/dev/null || true)"
-  if git_net fetch origin "$VAULT_BRANCH" >/dev/null 2>&1; then
-    if ! git -C "$VAULT_DIR" merge-base --is-ancestor "origin/$VAULT_BRANCH" HEAD 2>/dev/null; then
-      if ! git -C "$VAULT_DIR" merge --no-edit "origin/$VAULT_BRANCH" >/dev/null 2>&1; then
-        if ! resolve_conflicts_sync_style; then
-          git -C "$VAULT_DIR" merge --abort >/dev/null 2>&1 || true
-          log "WARNING: merge failed and conflicted-copy resolution also failed -"
-          log "         leaving tree as-is (retrying next pass; never force-pushing)."
-        fi
+  storage_check || { health_write || true; return; }
+  git_net fetch origin "$VAULT_BRANCH" >/dev/null 2>"$GIT_ERROR_FILE"; rc=$?
+  if [ "$rc" -ne 0 ]; then git_failure fetch "$rc"; return; fi
+  LAST_FETCH_SUCCESS="$(date +%s)"
+  if ! git -C "$VAULT_DIR" merge-base --is-ancestor "origin/$VAULT_BRANCH" HEAD 2>/dev/null; then
+    storage_check || { health_write || true; return; }
+    if ! git -C "$VAULT_DIR" merge --no-edit "origin/$VAULT_BRANCH" >/dev/null 2>"$GIT_ERROR_FILE"; then
+      if ! resolve_conflicts_sync_style; then
+        git -C "$VAULT_DIR" merge --abort >/dev/null 2>&1 || true
+        GIT_STATE=failed; GIT_REASON=merge_failed; LAST_GIT_RC=1
+        log "WARNING: merge failed and conflicted-copy resolution also failed -"
+        log "         leaving tree as-is (retrying next pass; never force-pushing)."
+        health_write || true; return
       fi
     fi
   fi
   after_rev="$(git -C "$VAULT_DIR" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$after_rev" ] && [ "$after_rev" != "$before_rev" ] && RECONCILE_ACTIVITY=1
 
-  # 3. Push whatever is now ahead of the remote.
   if ! git -C "$VAULT_DIR" merge-base --is-ancestor HEAD "origin/$VAULT_BRANCH" 2>/dev/null; then
-    git_net push origin "$VAULT_BRANCH" >/dev/null 2>&1 \
-      || log "push failed (retrying next pass; never force-pushing)."
+    storage_check || { health_write || true; return; }
+    git_net push origin "$VAULT_BRANCH" >/dev/null 2>"$GIT_ERROR_FILE"; rc=$?
+    if [ "$rc" -ne 0 ]; then git_failure push "$rc"; return; fi
+    LAST_PUSH_SUCCESS="$(date +%s)"
   fi
+  GIT_STATE=ok; GIT_REASON=ok; LAST_GIT_RC=0
+  dirty="$(git -C "$VAULT_DIR" status --porcelain 2>"$GIT_ERROR_FILE")"; rc=$?
+  if [ "$rc" -ne 0 ]; then git_failure status "$rc"; return; fi
+  if [ -n "$dirty" ]; then GIT_STATE=held; GIT_REASON=local_changes_withheld
+  else LAST_RECONCILE_SUCCESS="$(date +%s)"; fi
+  health_write || true
 }
 
 # --- 6. Reconcile loop: event-driven + adaptive periodic, one at a time -----
@@ -1111,21 +1437,36 @@ update_interval() {
 
 OB_RESTART_AFTER=0
 while true; do
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || break
   if [ "$HAVE_INOTIFY" -eq 1 ] && ! kill -0 "$INOTIFY_PID" 2>/dev/null; then
     log "WARNING: inotifywait died - restarting watch"
     start_inotify_watch
   fi
 
-  # ob restart-on-death, rate-limited to one attempt per 5s so a fast-crashing
-  # ob (bad credentials revoked mid-run, say) cannot busy-loop the daemon.
-  if [ "$HAVE_OB" -eq 1 ] && ! kill -0 "$OB_PID" 2>/dev/null; then
+  # Capacity is independent of child liveness. A healthy-looking process must
+  # not keep consuming the last bytes; a blocked one must not restart-loop.
+  if ! storage_check; then
+    stop_owned_ob || true
+    health_write || true
+  elif ! git_worktree_ready; then
+    stop_owned_ob || true
+    health_write || true
+  elif ! owned_ob_running; then
+    [ -z "$OB_PID" ] || { wait "$OB_PID" 2>/dev/null || true; OB_PID=""; }
+    [ "$SYNC_MODE" != configured ] || SYNC_STATE=not_ready
     now_ts="$(date +%s)"
-    if [ "$now_ts" -ge "$OB_RESTART_AFTER" ]; then
-      log "WARNING: ob sync exited - restarting"
-      start_ob_continuous
-      OB_RESTART_AFTER=$(( now_ts + 5 ))
+    if [ "$now_ts" -ge "$OB_RESTART_AFTER" ] && command -v ob >/dev/null 2>&1; then
+      if [ "$HAVE_OB" -eq 1 ]; then
+        log "WARNING: ob sync exited - restarting after storage preflight"
+        start_ob_continuous || true
+      elif [ "$SYNC_MODE" = configured ] && ensure_ob_auth && ensure_ob_setup; then
+        HAVE_OB=1; start_ob_continuous || true
+      fi
+      OB_RESTART_AFTER=$((now_ts+5))
     fi
+    health_write || true
   fi
+  cache_maintenance
 
   # Heartbeat. Every pass is silent on success by design (only WARNING/FATAL/
   # CONFLICT log), which means an operator reading logs cannot tell a healthy
@@ -1161,8 +1502,10 @@ while true; do
       debounce_drain
     fi
   else
-    sleep "$CURRENT_INTERVAL"
+    bridge_pause "$CURRENT_INTERVAL"
   fi
+
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || break
 
   reconcile_pass
 
