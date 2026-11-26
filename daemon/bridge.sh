@@ -793,7 +793,7 @@ ensure_ob_auth() {
   return 1
 }
 
-# Push the conflict strategy, mode and config categories at the stored per-vault
+# Push the conflict strategy, mode, file types and config categories at the stored per-vault
 # sync config. Split out of the link step deliberately: `sync-config` is
 # idempotent and `ensure_ob_setup` returns early for an ALREADY-linked vault, so
 # leaving this inline meant a settings change could only ever reach a vault that
@@ -806,7 +806,13 @@ apply_sync_config() {
   # `conflict` here would make the bridged experience WORSE than plain Sync
   # (conflict litter a Sync-only user never sees). Git history is the safety
   # net that makes merge safe: every pre-merge state is a commit.
-  set -- sync-config --path "$VAULT_DIR" --conflict-strategy merge --mode bidirectional
+  # The worker bridges the full visible vault. An omitted --file-types retains
+  # an older stored filter, which defaults to excluding unsupported extensions
+  # such as notebooks/text/archives. Assert all five on every boot without
+  # changing the operator's separately configured folder exclusions.
+  set -- sync-config --path "$VAULT_DIR" --conflict-strategy merge --mode bidirectional \
+    --file-types image,audio,pdf,video,unsupported
+  log 'sync-config: asking Obsidian Sync to carry file types: image,audio,pdf,video,unsupported'
   # Always passed, empty included. Omitting the flag is NOT "use a default" -
   # cli.js gates on `configs !== undefined`, so an omitted flag leaves whatever
   # is already stored untouched, which is the bug this whole block exists to
@@ -823,8 +829,8 @@ apply_sync_config() {
     return 0
   fi
   SYNC_CONFIGS_STATE="FAILED"
-  log "WARNING: sync-config failed - conflict strategy AND config categories are unchanged."
-  log "         Devices may receive no .obsidian/ config. Check the category names against"
+  log "WARNING: sync-config failed - conflict strategy AND config categories are unchanged; file types remain unverified."
+  log "         Devices may receive no .obsidian/ config or unsupported files. Check the category and file-type names against"
   log "         'ob sync-config --help' for the pinned obsidian-headless version."
   return 1
 }

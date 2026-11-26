@@ -153,6 +153,14 @@ to, per vault, in eight named categories**. `ob sync-setup` — the command this
 link a vault — writes no such setting at all, and Sync reads an absent setting as *none*. So
 the default state of a freshly linked vault is **config syncing entirely off**.
 
+Visible file types are a separate source-side filter. The bridge explicitly sets
+`--file-types image,audio,pdf,video,unsupported` on every new or existing vault boot.
+`unsupported` is the headless client's name for all other extensions, including text,
+notebooks and archives; omitting the flag preserves an older four-type filter and can
+leave those files absent while Sync reports complete. This full-vault file-type default
+also applies when `VAULT_SYNC_CONFIGS` is narrowed or empty. Existing folder exclusions
+are preserved, so an intentional excluded subtree remains separate from type coverage.
+
 ### The symptom, and why it is so hard to diagnose
 
 Every device shows **"You currently have 0 plugins installed"**, with Restricted mode off and
