@@ -15,7 +15,7 @@ PASS=0; FAIL=0
 make_stub() {
   cat > "$1" <<'STUB'
 #!/usr/bin/env bash
-echo "LAUNCHED name=${VAULT_NAME:-} repo=${VAULT_REPO:-} dir=${VAULT_DIR:-} token=${OBSIDIAN_AUTH_TOKEN:-} encpw=${VAULT_SYNC_ENCRYPTION_PASSWORD:-} sparse=${VAULT_EXCLUDE_AGENT_MEMORY:-} cache=${VAULT_LFS_CACHE_BUDGET_BYTES:-} cacheinterval=${VAULT_LFS_CACHE_INTERVAL:-}"
+echo "LAUNCHED name=${VAULT_NAME:-} repo=${VAULT_REPO:-} dir=${VAULT_DIR:-} token=${OBSIDIAN_AUTH_TOKEN:-} encpw=${VAULT_SYNC_ENCRYPTION_PASSWORD:-} sparse=${VAULT_EXCLUDE_AGENT_MEMORY:-} cache=${VAULT_LFS_CACHE_BUDGET_BYTES:-} cacheinterval=${VAULT_LFS_CACHE_INTERVAL:-} profile=${VAULT_CHECKOUT_PROFILE:-}"
 exit 0
 STUB
   chmod +x "$1"
@@ -91,12 +91,14 @@ rm -rf "$S"
 # A global VAULT_REPO/VAULT_DIR would otherwise point every vault at one repo
 # and cross-contaminate their sync state.
 S="$(mktemp -d)"
-printf 'VAULT_REPO=https://example.invalid/own.git\n' > "$S/vault-one.env"
+printf 'VAULT_REPO=https://example.invalid/own.git\nVAULT_CHECKOUT_PROFILE=obsidian\n' > "$S/vault-one.env"
 printf 'VAULT_REPO=https://example.invalid/two.git\n' > "$S/vault-two.env"
-OUT="$(run_entry "$S" VAULT_REPO=https://example.invalid/GLOBAL.git VAULT_DIR=/data/GLOBAL)"
+OUT="$(run_entry "$S" VAULT_REPO=https://example.invalid/GLOBAL.git VAULT_DIR=/data/GLOBAL VAULT_CHECKOUT_PROFILE=GLOBAL)"
 check "global VAULT_REPO does not override a vault's own" "0" "$(echo "$OUT" | grep -c 'GLOBAL.git')"
 check "global VAULT_DIR does not collapse vaults into one dir" "0" "$(echo "$OUT" | grep -c 'dir=/data/GLOBAL')"
 check "both vaults still use their own repo" "2" "$(echo "$OUT" | grep -c 'repo=https://example.invalid/\(own\|two\).git')"
+check "secret-file checkout profile reaches only its owner" "1" "$(echo "$OUT" | grep 'name=one' | grep -c 'profile=obsidian')"
+check "secret-file sibling cannot inherit global checkout profile" "0" "$(echo "$OUT" | grep 'name=two' | grep -c 'profile=GLOBAL\|profile=obsidian')"
 rm -rf "$S"
 
 # --- 7. Indexed env-group mode: VAULT_n identifiers, name derived from repo --
@@ -106,8 +108,10 @@ OUT="$(run_entry "$S" \
   VAULT_2=https://example.invalid/PersonalVault.git \
   VAULT_2_SYNC_ENCRYPTION_PASSWORD=two-only-secret \
   VAULT_EXCLUDE_AGENT_MEMORY=GLOBAL \
+  VAULT_CHECKOUT_PROFILE=GLOBAL \
   VAULT_LFS_CACHE_BUDGET_BYTES=GLOBAL \
   VAULT_2_EXCLUDE_AGENT_MEMORY=1 \
+  VAULT_2_CHECKOUT_PROFILE=obsidian \
   VAULT_2_LFS_CACHE_BUDGET_BYTES=536870912 \
   VAULT_2_LFS_CACHE_INTERVAL=300)"
 names="$(echo "$OUT" | grep -o 'LAUNCHED name=[a-z]*' | sed 's/LAUNCHED name=//' | sort | tr '\n' ',')"
@@ -121,7 +125,9 @@ check "the owning vault does receive its password" "1" \
 check "sparse exclusion reaches only its indexed owner" "1" \
   "$(echo "$OUT" | grep 'name=personalvault' | grep -c 'sparse=1 cache=536870912 cacheinterval=300')"
 check "global footprint flags cannot leak to a sibling" "0" \
-  "$(echo "$OUT" | grep 'name=planningvault' | grep -c 'GLOBAL\|sparse=1\|cache=536870912')"
+  "$(echo "$OUT" | grep 'name=planningvault' | grep -c 'GLOBAL\|sparse=1\|cache=536870912\|profile=obsidian')"
+check "Obsidian checkout profile reaches only its indexed owner" "1" \
+  "$(echo "$OUT" | grep 'name=personalvault' | grep -c 'profile=obsidian')"
 rm -rf "$S"
 
 # --- 8. Index gaps tolerated; explicit _NAME override; precedence over files -

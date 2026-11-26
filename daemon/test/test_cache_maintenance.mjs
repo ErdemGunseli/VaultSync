@@ -6,7 +6,7 @@ import os from 'node:os';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { maintainCache } from '../cache-maintenance.mjs';
+import { maintainCache, verifyRemoteObjects } from '../cache-maintenance.mjs';
 
 async function fixture(t, responder) {
   const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), 'lfs-cache-test-'));
@@ -44,6 +44,47 @@ async function fixture(t, responder) {
 const ack = (request) => ({ transfer: 'basic', objects: request.objects.map((object) => ({ ...object,
   actions: { download: { href: 'https://download.invalid/object?signature=private-signed-url' } } })) });
 const exists = async (filename) => fs.access(filename).then(() => true, () => false);
+
+test('read-only ACK API confirms backup-only objects without cache materialization or source changes', async (t) => {
+  const f = await fixture(t), body = Buffer.from('retained outside the LFS cache');
+  const object = { oid: createHash('sha256').update(body).digest('hex'), size: body.length };
+  const result = await verifyRemoteObjects(f.repo, { objects: [object] }, { allowHttpLoopback: true, env: { GIT_TOKEN: 'dummy' } });
+  assert.equal(result.status, 'verified'); assert.deepEqual(result.confirmed, [object]);
+  assert.equal(f.requests.length, 1); assert.deepEqual(await fs.readdir(f.root), []);
+  assert.equal(await fs.readFile(path.join(f.repo, 'source.md'), 'utf8'), 'worktree source must survive');
+});
+
+test('read-only ACK API skips exact404 but returns no authority after any later failed batch', async (t) => {
+  let calls = 0, failed = false;
+  const f = await fixture(t, (body, response) => {
+    calls++;
+    if (failed && calls === 2) { response.statusCode = 401; response.end(); return; }
+    response.end(JSON.stringify({ objects: body.objects.map((object) => calls === 1 && !failed
+      ? { ...object, error: { code: 404, message: 'not uploaded' } } : ack({ objects: [object] }).objects[0]) }));
+  });
+  const objects = ['one', 'two'].map((s) => ({ oid: createHash('sha256').update(s).digest('hex'), size: s.length }));
+  const deps = { allowHttpLoopback: true, env: { GIT_TOKEN: 'dummy' } };
+  let result = await verifyRemoteObjects(f.repo, { objects, limits: { batchSize: 1 } }, deps);
+  assert.equal(result.status, 'verified'); assert.equal(result.unavailable, 1); assert.deepEqual(result.confirmed, [objects[1]]);
+  calls = 0; failed = true;
+  result = await verifyRemoteObjects(f.repo, { objects, limits: { batchSize: 1 } }, deps);
+  assert.equal(result.status, 'blocked'); assert.deepEqual(result.confirmed, []);
+});
+
+test('read-only ACK API rejects duplicates, malformed input and byte/object/time overruns before authority', async (t) => {
+  const f = await fixture(t), object = { oid: 'a'.repeat(64), size: 10 };
+  for (const input of [{ objects: [object, object] }, { objects: [{ ...object, size: -1 }] },
+    { objects: [{ ...object, path: 'private' }] }, { objects: [object], limits: { maxBytes: 9 } },
+    { objects: [object], limits: { maxObjects: 0 } }]) {
+    const result = await verifyRemoteObjects(f.repo, input, { allowHttpLoopback: true, env: { GIT_TOKEN: 'dummy' } });
+    assert.equal(result.status, 'blocked'); assert.deepEqual(result.confirmed, []);
+  }
+  assert.equal(f.requests.length, 0);
+  let clock = 0;
+  const result = await verifyRemoteObjects(f.repo, { objects: [object], limits: { maxSeconds: 1 } },
+    { now: () => clock += 1000, allowHttpLoopback: true, env: { GIT_TOKEN: 'dummy' } });
+  assert.equal(result.status, 'blocked'); assert.deepEqual(result.confirmed, []);
+});
 
 test('default dry-run verifies recoverability without changing cache, source or refs', async (t) => {
   const f = await fixture(t); const object = await f.put(Buffer.from('recoverable bytes'));

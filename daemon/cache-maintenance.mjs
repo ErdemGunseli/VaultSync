@@ -269,6 +269,41 @@ async function acknowledge(endpoint, authorization, candidates, options, remaini
   return { acknowledged, unavailable };
 }
 
+// Read-only origin acknowledgement for retained operator recovery bytes. The
+// caller must hash its own source; nothing here writes cache/worktree/history.
+export async function verifyRemoteObjects(repo, { objects, limits = {} } = {}, deps = {}) {
+  const options = { ...defaults, ...limits }, now = deps.now || (() => Date.now());
+  const deadline = now() + options.maxSeconds * 1000, remaining = () => deadline - now();
+  try {
+    for (const key of ['maxBytes', 'maxObjects', 'maxSeconds', 'batchSize', 'requestTimeoutMs'])
+      if (!safeInteger(options[key]) || !options[key]) refuse('invalid_limits');
+    if (options.maxObjects > 10000 || options.maxBytes > defaults.maxBytes || options.maxSeconds > 600 || options.batchSize > 128
+        || !Array.isArray(objects) || objects.length > options.maxObjects) refuse('invalid_limits');
+    const requested = [], unique = new Set(); let bytes = 0;
+    for (const object of objects) {
+      if (!object || Object.keys(object).sort().join(',') !== 'oid,size' || typeof object.oid !== 'string' || !OID.test(object.oid)
+          || !safeInteger(object.size) || unique.has(object.oid)) refuse('invalid_objects');
+      bytes += object.size; if (!safeInteger(bytes) || bytes > options.maxBytes) refuse('byte_limit');
+      unique.add(object.oid); requested.push({ oid: object.oid, size: object.size });
+    }
+    if (!requested.length) return { status: 'verified', reason: 'no_objects', confirmed: [], unavailable: 0 };
+    repo = await ordinaryDirectory(repo);
+    await ordinaryDirectory(path.join(repo, '.git'));
+    if (await git(repo, ['rev-parse', '--show-toplevel'], undefined, remaining) !== repo) refuse('unsupported_repository');
+    const { endpoint, authorization } = await configuredEndpoint(repo, remaining, deps);
+    const confirmed = []; let unavailable = 0;
+    for (let index = 0; index < requested.length; index += options.batchSize) {
+      if (remaining() <= 0) refuse('time_limit');
+      const result = await acknowledge(endpoint, authorization, requested.slice(index, index + options.batchSize), options, remaining, deps);
+      confirmed.push(...result.acknowledged); unavailable += result.unavailable;
+    }
+    return { status: 'verified', reason: 'remote_acknowledged', confirmed, unavailable };
+  } catch (error) {
+    // An earlier valid batch never authorizes deletion after a later failure.
+    return { status: 'blocked', reason: error instanceof Refusal ? error.reason : 'operation_unavailable', confirmed: [], unavailable: 0 };
+  }
+}
+
 export async function maintainCache(input = {}, deps = {}) {
   const options = { ...defaults, ...input };
   const report = { status: 'blocked', reason: 'unverified', apply: !!options.apply,

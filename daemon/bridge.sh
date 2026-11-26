@@ -367,8 +367,69 @@ git_failure() {
 # marker bytes as a resolution, or treat a lost index as intentional deletions.
 # Leave every byte/stage in place for explicit recovery, without abort/reset.
 GIT_OPERATION_WARNED=""
+GIT_INTENT_FILE="$VAULT_DIR/.git/vaultsync-mutation-intent"
+GIT_INTENT_RECEIPT=""
+GIT_MUTATION_HELD=0
+# A failed checkout can leave partial files without MERGE_HEAD. A durable intent
+# is created and fsynced before any worktree mutation; only this process's exact
+# untouched marker can be removed after a verified clean completion/abort.
+git_intent_io() {
+  node - "$VAULT_DIR/.git" "$1" "${2:-}" <<'NODE'
+const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');
+const [directory,action,value]=process.argv.slice(2),c=fs.constants;
+let dir,fd;
+const identity=(s,body)=>[s.dev,s.ino,s.mode,s.nlink,s.size,s.mtimeNs,s.ctimeNs,crypto.createHash('sha256').update(body).digest('hex')].join(':');
+try {
+  if(!fs.lstatSync(directory).isDirectory()||fs.lstatSync(directory).isSymbolicLink())throw Error();
+  dir=fs.openSync(directory,c.O_RDONLY|c.O_DIRECTORY|c.O_NOFOLLOW);
+  const file=process.platform==='linux'?`/proc/self/fd/${dir}/vaultsync-mutation-intent`:path.join(directory,'vaultsync-mutation-intent');
+  if(action==='create-intent'){
+    if(!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(value))throw Error();
+    fd=fs.openSync(file,c.O_WRONLY|c.O_CREAT|c.O_EXCL|c.O_NOFOLLOW,0o600);
+    const body=Buffer.from(JSON.stringify({schema:1,owner:crypto.randomBytes(24).toString('hex'),head:value})+'\n');
+    fs.writeFileSync(fd,body);fs.fsyncSync(fd);fs.fsyncSync(dir);
+    process.stdout.write(identity(fs.fstatSync(fd,{bigint:true}),body));
+  }else if(action==='clear-intent'){
+    fd=fs.openSync(file,c.O_RDONLY|c.O_NOFOLLOW);
+    const before=fs.fstatSync(fd,{bigint:true});
+    if(!before.isFile()||before.nlink!==1n||before.size>4096n)throw Error();
+    const body=fs.readFileSync(fd),current=fs.lstatSync(file,{bigint:true});
+    if(identity(before,body)!==value||identity(current,body)!==value)throw Error();
+    fs.unlinkSync(file);fs.fsyncSync(dir);
+  }else throw Error();
+}catch{process.exitCode=1;}finally{if(fd!==undefined)fs.closeSync(fd);if(dir!==undefined)fs.closeSync(dir);}
+NODE
+}
+git_intent_begin() {
+  local head receipt rc
+  head="$(git -C "$VAULT_DIR" rev-parse HEAD 2>"$GIT_ERROR_FILE")" || return 1
+  receipt="$(git_intent_io create-intent "$head" 2>"$GIT_ERROR_FILE")"; rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$receipt" ]; then
+    GIT_MUTATION_HELD=1; GIT_STATE=held; GIT_REASON=mutation_intent_unavailable; LAST_GIT_RC="$rc"
+    log 'WARNING: Git worktree mutation held: durable intent could not be created; no mutation attempted.'
+    health_write || true; return 1
+  fi
+  GIT_INTENT_RECEIPT="$receipt"
+}
+git_intent_finish() {
+  local dirty rc
+  git_worktree_ready 0 owned || return 1
+  dirty="$(git -C "$VAULT_DIR" status --porcelain 2>"$GIT_ERROR_FILE")"; rc=$?
+  if [ "$rc" -ne 0 ] || [ -n "$dirty" ] || [ -z "$GIT_INTENT_RECEIPT" ] ||
+     ! git_intent_io clear-intent "$GIT_INTENT_RECEIPT" 2>"$GIT_ERROR_FILE"; then
+    GIT_MUTATION_HELD=1; GIT_STATE=held; GIT_REASON=worktree_mutation_incomplete; LAST_GIT_RC="$rc"
+    log 'WARNING: Git worktree mutation incomplete; Native remains stopped and intent retained for explicit recovery.'
+    health_write || true; return 1
+  fi
+  GIT_INTENT_RECEIPT=""; GIT_MUTATION_HELD=0
+}
 git_worktree_ready() {
   local operation reason="" unmerged rc head_paths
+  if [ "$GIT_MUTATION_HELD" -eq 1 ] ||
+     { { [ -e "$GIT_INTENT_FILE" ] || [ -L "$GIT_INTENT_FILE" ]; } &&
+       { [ "${2:-}" != owned ] || [ -z "$GIT_INTENT_RECEIPT" ]; }; }; then
+    reason=worktree_mutation_incomplete
+  fi
   for operation in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do
     [ ! -e "$VAULT_DIR/.git/$operation" ] || reason=git_operation_in_progress
   done
@@ -394,35 +455,107 @@ git_worktree_ready() {
   GIT_OPERATION_WARNED=""
 }
 
-# Worker-only footprint policy. The repository/index/history keep every byte;
-# only a clean, derived checkout of this exact Git-only directory is omitted.
-# Existing sparse policies and any dirty/untracked/ignored content are refused
-# rather than replaced. This runs before an initial checkout, not after it.
+# Worker-only footprint policy. Keep the full Git index/history while omitting
+# clean derived files that Obsidian cannot use. Full remains the default and
+# preserves the older single-directory opt-in. Never replace a custom policy.
 EXCLUDE_AGENT_MEMORY="${VAULT_EXCLUDE_AGENT_MEMORY:-0}"
-configure_worker_sparse() {
-  case "$EXCLUDE_AGENT_MEMORY" in 1|true|yes) ;; *) return 0;; esac
-  local dirty patterns
-  if [ "${1:-0}" = 1 ]; then
-    # A successful --no-checkout clone has no index/worktree yet; status would
-    # call its intentionally absent files deletions. An unexpected local tree
-    # here is never ours to remove, even during this first checkout.
-    dirty=""; [ ! -e "$VAULT_DIR/.agent-memory" ] || dirty=present
+CHECKOUT_PROFILE="${VAULT_CHECKOUT_PROFILE:-full}"
+CHECKOUT_MODE=full
+LEGACY_SPARSE_PATTERNS=$'/*\n!/.agent-memory/'
+# Git ignore/attribute files are needed at every depth, including hidden
+# parents. Explicit directory exclusions keep similarly named directories
+# from accidentally including archives; .obsidian retains its full subtree.
+OBSIDIAN_SPARSE_PATTERNS=$'/*\n!**/.*\n**/.gitignore\n**/.gitattributes\n!**/.gitignore/\n!**/.gitattributes/\n/.obsidian/**'
+case "$CHECKOUT_PROFILE" in
+  obsidian) CHECKOUT_MODE=obsidian;;
+  full) case "$EXCLUDE_AGENT_MEMORY" in 1|true|yes) CHECKOUT_MODE=agent-memory;; esac;;
+  *) log 'FATAL: VAULT_CHECKOUT_PROFILE must be full or obsidian'; exit 1;;
+esac
+worker_checkout_includes() {
+  case "$CHECKOUT_MODE" in
+    full) return 0;;
+    agent-memory) case "$1" in .agent-memory|.agent-memory/*) return 1;; *) return 0;; esac;;
+  esac
+  case "$1" in .obsidian|.obsidian/*) return 0;; esac
+  case "${1##*/}" in .gitignore|.gitattributes) return 0;; esac
+  case "/$1" in */.*) return 1;; *) return 0;; esac
+}
+worker_sparse_clean() {
+  local initial="$1" record relative listing dirty=0
+  listing="$(umask 077; mktemp "$HEALTH_DIR/.$HEALTH_KEY.sparse.XXXXXX")" || return 1
+  if [ "$initial" = 1 ]; then
+    # No-checkout clones intentionally have no index yet. Inspect unexpected
+    # filesystem entries directly instead of mistaking tracked absences for edits.
+    if ! (cd "$VAULT_DIR" && find . -path ./.git -prune -o -print0) > "$listing" 2>"$GIT_ERROR_FILE"; then
+      rm -f "$listing"; return 1
+    fi
+    while IFS= read -r -d '' record; do
+      relative="${record#./}"
+      [ "$relative" = . ] && continue
+      if ! worker_checkout_includes "$relative"; then dirty=1; break; fi
+    done < "$listing"
   else
-    dirty="$(git -C "$VAULT_DIR" status --porcelain --ignored --untracked-files=all -- .agent-memory 2>"$GIT_ERROR_FILE")" || return 1
+    # Porcelain -z plus --no-renames yields one exact path per NUL record,
+    # including spaces, newlines and ignored/untracked excluded bytes.
+    if ! git -C "$VAULT_DIR" status --porcelain=v1 -z --no-renames --ignored --untracked-files=all > "$listing" 2>"$GIT_ERROR_FILE"; then
+      rm -f "$listing"; return 1
+    fi
+    while IFS= read -r -d '' record; do
+      if ! worker_checkout_includes "${record:3}"; then dirty=1; break; fi
+    done < "$listing"
   fi
-  if [ -n "$dirty" ]; then
-    log 'FATAL: worker sparse exclusion refused: .agent-memory has dirty, untracked, or ignored files; all retained.'
+  rm -f "$listing"
+  [ "$dirty" -eq 0 ]
+}
+worker_sparse_excluded_materialized() {
+  local listing record found=1
+  listing="$(umask 077; mktemp "$HEALTH_DIR/.$HEALTH_KEY.sparse.XXXXXX")" || return 2
+  if ! (cd "$VAULT_DIR" && find . -path ./.git -prune -o ! -type d -print0) > "$listing" 2>"$GIT_ERROR_FILE"; then
+    rm -f "$listing"; return 2
+  fi
+  while IFS= read -r -d '' record; do
+    if ! worker_checkout_includes "${record#./}"; then found=0; break; fi
+  done < "$listing"
+  rm -f "$listing"; return "$found"
+}
+configure_worker_sparse() {
+  [ "$CHECKOUT_MODE" != full ] || [ "${1:-0}" = 1 ] || return 0
+  local patterns dirty rc wanted="$LEGACY_SPARSE_PATTERNS"
+  [ "$CHECKOUT_MODE" != obsidian ] || wanted="$OBSIDIAN_SPARSE_PATTERNS"
+  if [ "$CHECKOUT_MODE" != full ] && ! worker_sparse_clean "${1:-0}"; then
+    log 'FATAL: worker sparse exclusion refused: excluded paths have dirty, untracked, or ignored files; all retained.'
     GIT_STATE=failed; GIT_REASON=sparse_dirty; health_write || true; return 1
   fi
-  if [ "$(git -C "$VAULT_DIR" config --bool core.sparseCheckout 2>/dev/null || true)" = true ]; then
+  if [ "$CHECKOUT_MODE" != full ] && [ "$(git -C "$VAULT_DIR" config --bool core.sparseCheckout 2>/dev/null || true)" = true ]; then
     patterns="$(git -C "$VAULT_DIR" rev-parse --git-path info/sparse-checkout)"
     case "$patterns" in /*) ;; *) patterns="$VAULT_DIR/$patterns";; esac
-    if [ "$(cat "$patterns" 2>/dev/null)" != $'/*\n!/.agent-memory/' ]; then
+    patterns="$(cat "$patterns" 2>/dev/null)"
+    if [ "$(git -C "$VAULT_DIR" config --bool core.sparseCheckoutCone 2>/dev/null || true)" = true ] ||
+       { [ "$patterns" != "$wanted" ] && { [ "$CHECKOUT_MODE" != obsidian ] || [ "$patterns" != "$LEGACY_SPARSE_PATTERNS" ]; }; }; then
       log 'FATAL: worker sparse exclusion refused: a different sparse policy already exists.'
       GIT_STATE=failed; GIT_REASON=sparse_policy_conflict; health_write || true; return 1
     fi
+    if [ "$patterns" = "$wanted" ] && [ "${1:-0}" != 1 ]; then
+      # A stable existing sparse checkout needs no worktree mutation. Keep
+      # legitimate uncommitted visible saves available to normal reconciliation.
+      worker_sparse_excluded_materialized; rc=$?
+      if [ "$rc" -eq 1 ]; then
+        log "worker checkout profile=$CHECKOUT_MODE already configured; no checkout mutation needed."
+        return 0
+      elif [ "$rc" -ne 0 ]; then return 1; fi
+    fi
   fi
-  if ! printf '/*\n!/.agent-memory/\n' | git -C "$VAULT_DIR" sparse-checkout set --no-cone --stdin >/dev/null 2>"$GIT_ERROR_FILE"; then
+  if owned_ob_running && ! stop_owned_ob; then return 1; fi
+  if [ "${1:-0}" != 1 ]; then
+    dirty="$(git -C "$VAULT_DIR" status --porcelain 2>"$GIT_ERROR_FILE")"; rc=$?
+    if [ "$rc" -ne 0 ] || [ -n "$dirty" ]; then
+      GIT_STATE=held; GIT_REASON=checkout_requires_clean_tree; LAST_GIT_RC="$rc"
+      log 'WARNING: checkout policy change deferred: a clean index and worktree are required; all local bytes retained.'
+      health_write || true; return 1
+    fi
+  fi
+  git_intent_begin || return 1
+  if [ "$CHECKOUT_MODE" != full ] && ! printf '%s\n' "$wanted" | git -C "$VAULT_DIR" sparse-checkout set --no-cone --stdin >/dev/null 2>"$GIT_ERROR_FILE"; then
     log 'FATAL: worker sparse exclusion failed; no history or source deletion attempted.'
     GIT_STATE=failed; GIT_REASON=sparse_failed; health_write || true; return 1
   fi
@@ -436,7 +569,8 @@ configure_worker_sparse() {
       GIT_STATE=failed; GIT_REASON=sparse_initial_checkout_failed; health_write || true; return 1
     fi
   fi
-  log 'worker checkout excludes clean /.agent-memory/; index, history, origin and visible Sync files retained.'
+  git_intent_finish || return 1
+  log "worker checkout profile=$CHECKOUT_MODE; index, history, origin and visible Sync files retained."
 }
 
 # Optional bounded verified LFS-cache maintenance. The helper only evicts
@@ -590,8 +724,8 @@ if [ ! -d "$VAULT_DIR/.git" ]; then
   # Capture git's own stderr instead of discarding it. The generic guess-list
   # below is useful, but "Remote branch main not found" or "No space left on
   # device" is the actual answer, and it was being thrown away.
-  clone_args=(--branch "$VAULT_BRANCH")
-  case "$EXCLUDE_AGENT_MEMORY" in 1|true|yes) clone_args+=(--no-checkout); INITIAL_CHECKOUT=1;; esac
+  clone_args=(--branch "$VAULT_BRANCH" --no-checkout)
+  INITIAL_CHECKOUT=1
   clone_err="$(git clone "${clone_args[@]}" "$VAULT_REPO" "$VAULT_DIR" 2>&1 >/dev/null)" || {
     # Never echo the URL: it carries the token. Strip anything before '@'.
     log "FATAL: clone failed. Not retrying blindly. git said:"
@@ -733,6 +867,7 @@ HAVE_OB=0
 start_ob_continuous() {
   [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
   storage_check || { health_write || true; return 1; }
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
   OB_STARTED_AT="$(date +%s)"; OB_GENERATION=$((OB_GENERATION+1))
   OB_RUN_ID="$$-$OB_STARTED_AT-$OB_GENERATION"
   SYNC_MODE=configured; SYNC_STATE=starting
@@ -753,6 +888,18 @@ start_ob_continuous() {
           printf '[ob:%s] %s\n' "$NAME" "$_ob_line" >&2
         done) 2>&1 &
   OB_PID=$!
+}
+
+# Git can write conflict markers and partial trees before merge reports failure.
+# Native Sync must observe only the completed merge or its completed abort.
+# Status, local commits and fetch leave the working tree alone and need no pause.
+resume_ob_after_git_merge() {
+  [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
+  git_worktree_ready || { health_write || true; return 1; }
+  storage_check || { health_write || true; return 1; }
+  if [ "$1" = 1 ] && [ "$HAVE_OB" -eq 1 ] && ! owned_ob_running; then
+    start_ob_continuous
+  fi
 }
 
 # Seconds of total ob silence that count as "probably not syncing". ob narrates
@@ -1344,7 +1491,7 @@ RECONCILE_ACTIVITY=0
 reconcile_pass() {
   [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
   RECONCILE_ACTIVITY=0
-  local before_rev after_rev dirty rc
+  local before_rev after_rev dirty rc resume_ob=0
   if ! storage_check; then stop_owned_ob || true; health_write || true; return; fi
   if ! git_worktree_ready; then stop_owned_ob || true; health_write || true; return; fi
   GIT_STATE=pending; GIT_REASON=reconciling; LAST_GIT_RC=0
@@ -1379,15 +1526,45 @@ reconcile_pass() {
   LAST_FETCH_SUCCESS="$(date +%s)"
   if ! git -C "$VAULT_DIR" merge-base --is-ancestor "origin/$VAULT_BRANCH" HEAD 2>/dev/null; then
     storage_check || { health_write || true; return; }
-    if ! git -C "$VAULT_DIR" merge --no-edit "origin/$VAULT_BRANCH" >/dev/null 2>"$GIT_ERROR_FILE"; then
-      if ! resolve_conflicts_sync_style; then
-        git -C "$VAULT_DIR" merge --abort >/dev/null 2>&1 || true
-        GIT_STATE=failed; GIT_REASON=merge_failed; LAST_GIT_RC=1
-        log "WARNING: merge failed and conflicted-copy resolution also failed -"
-        log "         leaving tree as-is (retrying next pass; never force-pushing)."
+    if owned_ob_running; then
+      resume_ob=1
+      if ! stop_owned_ob; then
+        GIT_STATE=held; GIT_REASON=sync_stop_failed; LAST_GIT_RC=0
+        log 'WARNING: Git merge held: managed Native Sync has not stopped; working tree retained.'
         health_write || true; return
       fi
     fi
+    [ "$SHUTDOWN_REQUESTED" -eq 0 ] || exit 0
+    # Native may have finished a save after the first commit but during fetch.
+    # No Git mutation has started yet: preserve it for the next local commit.
+    dirty="$(git -C "$VAULT_DIR" status --porcelain 2>"$GIT_ERROR_FILE")"; rc=$?
+    if [ "$rc" -ne 0 ]; then git_failure status "$rc"; return; fi
+    if [ -n "$dirty" ]; then
+      GIT_STATE=held; GIT_REASON=local_changes_after_sync_stop; LAST_GIT_RC=0
+      log 'WARNING: incoming Git mutation deferred: final Native writes remain for the next local commit.'
+      resume_ob_after_git_merge "$resume_ob" || true
+      health_write || true; return
+    fi
+    git_intent_begin || return
+    if ! git -C "$VAULT_DIR" merge --no-edit "origin/$VAULT_BRANCH" >/dev/null 2>"$GIT_ERROR_FILE"; then
+      if ! resolve_conflicts_sync_style; then
+        if git -C "$VAULT_DIR" merge --abort >/dev/null 2>"$GIT_ERROR_FILE"; then
+          git_intent_finish || return
+        else
+          GIT_MUTATION_HELD=1
+          GIT_STATE=held; GIT_REASON=worktree_mutation_incomplete; LAST_GIT_RC=1
+          log 'WARNING: Git abort did not complete; persistent intent and all working bytes retained.'
+          health_write || true; return
+        fi
+        GIT_STATE=failed; GIT_REASON=merge_failed; LAST_GIT_RC=1
+        log "WARNING: merge failed and conflicted-copy resolution also failed -"
+        log "         leaving tree as-is (retrying next pass; never force-pushing)."
+        resume_ob_after_git_merge "$resume_ob" || true
+        health_write || true; return
+      fi
+    fi
+    git_intent_finish || return
+    resume_ob_after_git_merge "$resume_ob" || return
   fi
   after_rev="$(git -C "$VAULT_DIR" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$after_rev" ] && [ "$after_rev" != "$before_rev" ] && RECONCILE_ACTIVITY=1
