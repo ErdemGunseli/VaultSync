@@ -218,7 +218,7 @@ async function acknowledge(endpoint, authorization, candidates, options, remaini
       body, signal: AbortSignal.timeout(Math.max(1, Math.min(options.requestTimeoutMs, remaining()))) });
   } catch { refuse('remote_request_failed'); }
   if (response.status !== 200) { await response.body?.cancel(); refuse('remote_http_error'); }
-  if (!/^application\/vnd\.git-lfs\+json(?:;|$)/i.test(response.headers.get('content-type') || '')) {
+  if (!/^application\/(?:vnd\.git-lfs\+json|json)(?:;|$)/i.test(response.headers.get('content-type') || '')) {
     await response.body?.cancel(); refuse('remote_response_invalid');
   }
   const reader = response.body?.getReader();

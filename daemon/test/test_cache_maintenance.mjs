@@ -67,6 +67,24 @@ test('apply only evicts exact locally hashed, remotely acknowledged LFS cache ob
   assert.ok(f.requests.every((request) => request.method === 'POST' && request.body.operation === 'download'));
 });
 
+test('GitHub application/json batch response acknowledges exact recoverable objects', async (t) => {
+  const f = await fixture(t, (body, response) => {
+    response.setHeader('Content-Type', 'application/json; charset=utf-8');
+    response.end(JSON.stringify({ objects: body.objects.map((object) => ({ ...object,
+      authenticated: true, actions: { download: {
+        href: 'https://download.invalid/object?signature=private-signed-url',
+        expires_in: 3600, expires_at: new Date(Date.now() + 3600000).toISOString(),
+      } },
+    })) }));
+  });
+  const object = await f.put(Buffer.from('GitHub response compatibility'));
+  const report = await f.run({ apply: true });
+  assert.equal(report.status, 'complete'); assert.equal(report.removedObjects, 1);
+  assert.equal(await exists(object.filename), false);
+  assert.equal(JSON.stringify(report).includes(object.oid), false);
+  assert.equal(JSON.stringify(report).includes('private-signed-url'), false);
+});
+
 test('401, redirects, missing remote objects and malformed responses preserve every cache object', async (t) => {
   const cases = [
     (_, r) => { r.statusCode = 401; r.end('private unauthorized body'); },
