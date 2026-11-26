@@ -74,7 +74,8 @@ supervise() {
           # at one repo/dir and corrupt their sync state into each other.
           unset VAULT_DIR VAULT_REPO VAULT_BRANCH VAULT_SYNC_REMOTE \
                 VAULT_SYNC_ENCRYPTION_PASSWORD VAULT_SYNC_CONFIGS \
-                VAULT_DEVICE_NAME VAULT_MAX_FILE_MB
+                VAULT_DEVICE_NAME VAULT_MAX_FILE_MB VAULT_EXCLUDE_AGENT_MEMORY \
+                VAULT_LFS_CACHE_BUDGET_BYTES VAULT_LFS_CACHE_INTERVAL
         fi
         if [ "$mode" = "file" ] && [ -n "$secret" ]; then
           set -a
@@ -88,7 +89,8 @@ supervise() {
           src="VAULT_${idx}"
           export "VAULT_REPO=${!src}"
           for k in BRANCH SYNC_REMOTE SYNC_ENCRYPTION_PASSWORD \
-                   SYNC_CONFIGS DEVICE_NAME MAX_FILE_MB; do
+                   SYNC_CONFIGS DEVICE_NAME MAX_FILE_MB EXCLUDE_AGENT_MEMORY \
+                   LFS_CACHE_BUDGET_BYTES LFS_CACHE_INTERVAL; do
             src="VAULT_${idx}_${k}"
             if [ -n "${!src:-}" ]; then
               export "VAULT_${k}=${!src}"

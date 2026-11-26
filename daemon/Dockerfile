@@ -32,7 +32,7 @@ RUN npm install -g "obsidian-headless@${OBSIDIAN_HEADLESS_VERSION}" \
     && npm cache clean --force
 
 WORKDIR /app
-COPY bridge.sh entrypoint.sh /app/
+COPY bridge.sh entrypoint.sh cache-maintenance.mjs /app/
 RUN chmod +x /app/bridge.sh /app/entrypoint.sh
 
 # Sync state and vault clones both live on the mounted disk.

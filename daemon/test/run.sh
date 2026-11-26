@@ -7,5 +7,10 @@ for t in "$HERE"/test_*.sh; do
   printf '\n=== %s ===\n' "$(basename "$t")"
   bash "$t" || rc=1
 done
+for t in "$HERE"/test_*.mjs; do
+  [ -f "$t" ] || continue
+  printf '\n=== %s ===\n' "$(basename "$t")"
+  node --test "$t" || rc=1
+done
 printf '\n%s\n' "$([ $rc -eq 0 ] && echo 'ALL SUITES PASSED' || echo 'FAILURES PRESENT')"
 exit $rc

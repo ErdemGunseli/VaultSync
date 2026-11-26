@@ -94,7 +94,15 @@ else:
     im.save(out)
 PYEOF
   elif command -v vips >/dev/null 2>&1; then
-    vips gaussnoise "${out}[Q=97]" "$w" "$h" --sigma 90 >/dev/null 2>&1
+    # gaussnoise alone is one-band grayscale; its resized palette PNG can fit
+    # below1MiB and invalidates the refusal fixture. Match Pillow's RGB entropy
+    # with three independent, reproducibly seeded channels.
+    local noise; noise="$(mktemp -d)"
+    vips gaussnoise "$noise/r.v" "$w" "$h" --sigma 90 --seed 1 >/dev/null 2>&1 &&
+      vips gaussnoise "$noise/g.v" "$w" "$h" --sigma 90 --seed 2 >/dev/null 2>&1 &&
+      vips gaussnoise "$noise/b.v" "$w" "$h" --sigma 90 --seed 3 >/dev/null 2>&1 &&
+      vips bandjoin "$noise/r.v $noise/g.v $noise/b.v" "${out}[Q=97]" >/dev/null 2>&1
+    local rc=$?; rm -rf "$noise"; return "$rc"
   else
     return 1
   fi
