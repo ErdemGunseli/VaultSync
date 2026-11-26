@@ -28,6 +28,25 @@ recovery; ordinary `git add -A` must never turn existing conflict markers or a l
 into a successful delivery. Known new `--no-checkout` clones initialize and verify their
 index before this normal check applies.
 
+Before any Git merge or fast-forward modifies the working tree, the bridge stops only
+its managed native Sync child and confirms that it has exited. Native Sync resumes
+only after known clean completion or a successfully verified abort, with a clean index
+and worktree, no pending operation, no shutdown request, and adequate storage. Final
+Native saves that arrive during fetch defer the incoming merge until the next local
+commit; size-cap-held bytes are retained rather than reset to force a merge.
+
+Every bridge-managed checkout or incoming merge first creates and fsyncs a private
+`.git/vaultsync-mutation-intent`, including its parent directory. Fresh clones always
+use `--no-checkout`, then initialize their working tree under that fence. A crash or
+failed fast-forward can leave partial files without `MERGE_HEAD`: any leftover intent,
+including an empty file or symlink, holds startup and reconciliation. Only the process
+that created the exact unchanged marker can clear it after verified clean completion.
+Unknown intents are never automatically deleted, and no reset or clean attempts to
+repair partial bytes. Node 22, already included in the Docker image, supplies the durable
+file operations and is required for bridge-managed checkout and merge mutations.
+A child that refuses to stop also holds the merge. Status checks, local commits,
+fetches and idle passes do not restart native Sync.
+
 Shutdown signals set a flag; the loop exits after a timed read/wait returns, then performs
 cleanup through EXIT. This avoids a Bash read deadline interrupting a long signal trap
 and resuming writers. Idle sleeps and cache maintenance have owned, interruptible waits.
@@ -65,23 +84,38 @@ not proof that every device has received a particular file.
 | `VAULT_STORAGE_MIN_INODES` | `1024` | Block below this many free inodes. |
 | `VAULT_STORAGE_RESUME_INODES` | `2048` | Require this many inodes to resume. |
 | `VAULT_EXCLUDE_AGENT_MEMORY` | `0` | Opt in to excluding only `/.agent-memory/` from this worker checkout. |
+| `VAULT_CHECKOUT_PROFILE` | `full` | `obsidian` materializes visible paths, root `.obsidian/`, and `.gitignore`/`.gitattributes` at every depth; other hidden Git-only files stay in the index/history. |
 | `VAULT_LFS_CACHE_BUDGET_BYTES` | unset | Opt in to bounded, remotely verified LFS cache maintenance, e.g. `536870912` (512 MiB). |
 | `VAULT_LFS_CACHE_INTERVAL` | `300` | Seconds between bounded cache-maintenance attempts. |
 
 Footprint options are per vault: in indexed deployment use
-`VAULT_1_EXCLUDE_AGENT_MEMORY=1` and `VAULT_1_LFS_CACHE_BUDGET_BYTES=536870912` for the
+`VAULT_1_CHECKOUT_PROFILE=obsidian` and `VAULT_1_LFS_CACHE_BUDGET_BYTES=536870912` for the
 intended worker, using its actual configured index. Global footprint flags do not leak
 into indexed/file-mode siblings. Shared storage reserves and health-directory settings
 apply globally unless a vault's own secret file overrides them.
 
-The sparse option retains the complete Git index, history and origin, so `git add -A`,
+The sparse options retain the complete Git index, history and origin, so `git add -A`,
 fast-forwards and ordinary divergent merges retain the excluded bytes. New clones use
 `--no-checkout`, configure the exclusion and initialize the sparse index **before** any
-checkout can materialize the large directory. Existing clean copies can be omitted.
-Dirty, untracked or ignored bytes inside that directory, and any different existing
-sparse policy, cause refusal with all bytes retained. Visible notes and `.obsidian/`
-remain materialized. Enable it only on a bridge worker that has no consumer of this
-Git-only bookkeeping; it is not a policy for an owner's working vault.
+checkout can materialize Git-only archives. Existing clean copies can be omitted.
+Dirty, staged, untracked or ignored bytes in excluded paths cause refusal with all bytes
+retained. No cleanup, reset or source deletion is performed. The `obsidian` profile
+omits root and nested hidden paths such as `.agent-memory/` and `Course/.sources/`,
+while retaining all descendants of the root `.obsidian/` and the Git ignore/attribute
+files required at every depth, including inside otherwise excluded parents. Attributes
+retain their normal nested precedence and Git LFS behavior. Only the exact prior
+`VAULT_EXCLUDE_AGENT_MEMORY=1` policy can migrate automatically; a different custom sparse
+policy is refused unchanged. `full` retains existing behavior, including that legacy
+flag when set; `obsidian` takes precedence when both options are present.
+Changing a checkout policy requires a clean index and worktree. An unchanged policy
+with no excluded materialized files does no checkout mutation, so legitimate pending
+visible saves can enter normal reconciliation after restart.
+
+Enable the profile only on the bridge worker, which has no consumer for Git-only archive
+materializations. It changes no repository bytes, Git history, origin, or owner-device
+checkout. It does not bound history/object-cache size: the storage guard and verified LFS
+cache budget remain necessary. The non-cone policy uses a fixed seven-pattern definition,
+rather than a generated list that grows with the repository.
 
 The cache helper is independently callable in default dry-run mode:
 

@@ -137,7 +137,7 @@ setup_remote "$TMP"
 # real rather than asserting on a mocked flag.
 FAKEBIN="$TMP/fakebin"
 mkdir -p "$FAKEBIN"
-for tool in git git-lfs bash sh date grep sed printf mkdir rm cat head tr wc mktemp stat kill sleep timeout env find dirname basename ln df awk chmod mv; do
+for tool in git git-lfs node bash sh date grep sed printf mkdir rm cat head tr wc mktemp stat kill sleep timeout env find dirname basename ln df awk chmod mv; do
   p="$(command -v "$tool" 2>/dev/null || true)"
   [ -n "$p" ] && ln -sf "$p" "$FAKEBIN/$tool"
 done

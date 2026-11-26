@@ -59,7 +59,7 @@ test('read-only ACK API skips exact404 but returns no authority after any later 
   const f = await fixture(t, (body, response) => {
     calls++;
     if (failed && calls === 2) { response.statusCode = 401; response.end(); return; }
-    response.end(JSON.stringify({ objects: body.objects.map((object) => calls === 1
+    response.end(JSON.stringify({ objects: body.objects.map((object) => calls === 1 && !failed
       ? { ...object, error: { code: 404, message: 'not uploaded' } } : ack({ objects: [object] }).objects[0]) }));
   });
   const objects = ['one', 'two'].map((s) => ({ oid: createHash('sha256').update(s).digest('hex'), size: s.length }));
