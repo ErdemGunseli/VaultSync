@@ -150,6 +150,57 @@ test('per-object 404 in one batch cannot block verified objects in another; all 
   assert.equal(await exists(missing.filename), true);
 });
 
+test('count-only cursor reaches recoverable objects after an all-404 bounded prefix', async (t) => {
+  const unavailable = new Set();
+  const f = await fixture(t, (body, response) => response.end(JSON.stringify({ objects: body.objects.map((object) =>
+    unavailable.has(object.oid) ? { ...object, error: { code: 404, message: 'not uploaded' } }
+      : ack({ objects: [object] }).objects[0]) })));
+  const bodies = Array.from({ length: 5 }, (_, index) => Buffer.from(`cursor fixture ${index}`));
+  bodies.sort((a, b) => createHash('sha256').update(b).digest('hex').localeCompare(createHash('sha256').update(a).digest('hex')));
+  const objects = [];
+  for (const body of bodies) objects.push(await f.put(body));
+  objects.sort((a, b) => a.oid.localeCompare(b.oid));
+  objects.slice(0, 2).forEach((object) => unavailable.add(object.oid));
+  const limits = { apply: true, maxObjects: 2, maxBytes: 4096 };
+  let report = await f.run(limits);
+  assert.equal(report.reason, 'no_remote_recoverable_objects'); assert.equal(report.removedObjects, 0);
+  assert.equal(report.nextCursor, 2);
+  assert.deepEqual(f.requests[0].body.objects.map((object) => object.oid), objects.slice(0, 2).map((object) => object.oid));
+  let removed = 0;
+  for (let round = 0; round < 3; round++) {
+    report = await f.run({ ...limits, cursor: report.nextCursor }); removed += report.removedObjects;
+    assert.ok(Number.isSafeInteger(report.nextCursor) && report.nextCursor >= 0);
+    assert.ok(report.candidateObjects <= 2); assert.ok(report.candidateBytes <= 4096);
+  }
+  assert.equal(removed, 3);
+  for (const object of objects) assert.equal(await exists(object.filename), unavailable.has(object.oid));
+  for (const object of objects) assert.equal(JSON.stringify(report).includes(object.oid), false);
+});
+
+test('oversized first object cannot starve smaller recoverable objects or exceed byte budget', async (t) => {
+  const f = await fixture(t);
+  const large = await f.put(Buffer.alloc(4096, 3));
+  let body;
+  for (let index = 0; ; index++) {
+    body = Buffer.from(`small ${index}`);
+    if (createHash('sha256').update(body).digest('hex') > large.oid) break;
+  }
+  const small = await f.put(body);
+  const report = await f.run({ apply: true, maxBytes: 1024, maxObjects: 1 });
+  assert.equal(report.removedObjects, 1); assert.equal(report.removedBytes, small.size);
+  assert.equal(report.skipped.byte_limit, 1); assert.ok(report.candidateBytes <= 1024);
+  assert.equal(await exists(large.filename), true); assert.equal(await exists(small.filename), false);
+});
+
+test('invalid cursors fail closed before requests or changes', async (t) => {
+  const f = await fixture(t); const object = await f.put(Buffer.from('must remain'));
+  for (const cursor of [-1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1, '1']) {
+    const report = await f.run({ apply: true, cursor });
+    assert.equal(report.reason, 'invalid_limits'); assert.equal(report.removedObjects, 0);
+    assert.equal(await exists(object.filename), true); assert.equal(f.requests.length, 0);
+  }
+});
+
 test('corruption, hardlinks and symlinks are preserved and never advertised as verified', async (t) => {
   const f = await fixture(t);
   const bad = await f.put(Buffer.from('good')), linked = await f.put(Buffer.from('linked')), symbolic = await f.put(Buffer.from('symlink'));

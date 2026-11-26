@@ -15,7 +15,7 @@ const FANOUT = /^[a-f0-9]{2}$/;
 const MiB = 1024 * 1024;
 const defaults = { budgetBytes: 512 * MiB, targetFreeBytes: 256 * MiB,
   maxBytes: 2048 * MiB, maxObjects: 1024, maxSeconds: 120, batchSize: 64,
-  requestTimeoutMs: 10000, maxScanEntries: 100000, apply: false };
+  requestTimeoutMs: 10000, maxScanEntries: 100000, cursor: 0, apply: false };
 
 class Refusal extends Error { constructor(reason) { super(reason); this.reason = reason; } }
 const refuse = (reason) => { throw new Refusal(reason); };
@@ -139,7 +139,7 @@ async function freeBytes(repo, deps) {
 
 async function scanCache(root, options, checkTime, report) {
   const candidates = [];
-  let entries = 0, candidateBytes = 0;
+  let entries = 0;
   async function visit(folder, level, prefix = '') {
     const directory = await fs.opendir(folder);
     for await (const entry of directory) {
@@ -158,14 +158,15 @@ async function scanCache(root, options, checkTime, report) {
           report.skipped.layout = (report.skipped.layout || 0) + 1; continue;
         }
         if (s.nlink !== 1n) { report.skipped.hardlink = (report.skipped.hardlink || 0) + 1; continue; }
-        if (candidates.length >= options.maxObjects || size > options.maxBytes - candidateBytes) continue;
         candidates.push({ filename, parent: folder, oid: entry.name, size, fingerprint: fingerprint(s) });
-        candidateBytes += size;
       } else report.skipped.layout = (report.skipped.layout || 0) + 1;
     }
   }
   await visit(root, 0);
-  return candidates;
+  // Stable order makes the count-only cursor independent of filesystem readdir
+  // order. The scan-entry bound also bounds this metadata list; bytes are read
+  // only for the separately bounded window selected below.
+  return candidates.sort((left, right) => left.oid < right.oid ? -1 : left.oid > right.oid ? 1 : 0);
 }
 
 async function openCandidate(candidate, rootHandle) {
@@ -273,14 +274,14 @@ export async function maintainCache(input = {}, deps = {}) {
   const report = { status: 'blocked', reason: 'unverified', apply: !!options.apply,
     scannedObjects: 0, cacheBytes: 0, candidateObjects: 0, candidateBytes: 0,
     verifiedObjects: 0, verifiedBytes: 0, removedObjects: 0, removedBytes: 0,
-    freeBytesBefore: null, freeBytesAfter: null, skipped: {} };
+    freeBytesBefore: null, freeBytesAfter: null, nextCursor: 0, skipped: {} };
   const now = deps.now || (() => Date.now());
   const deadline = now() + options.maxSeconds * 1000;
   const remaining = () => deadline - now();
   const checkTime = () => { if (remaining() <= 0) refuse('time_limit'); };
   let rootHandle;
   try {
-    for (const key of ['budgetBytes', 'targetFreeBytes', 'maxBytes', 'maxObjects', 'maxSeconds', 'batchSize', 'requestTimeoutMs', 'maxScanEntries'])
+    for (const key of ['budgetBytes', 'targetFreeBytes', 'maxBytes', 'maxObjects', 'maxSeconds', 'batchSize', 'requestTimeoutMs', 'maxScanEntries', 'cursor'])
       if (!safeInteger(options[key])) refuse('invalid_limits');
     if (!options.repoDir || !options.maxBytes || !options.maxObjects || options.maxObjects > 10000 || !options.maxSeconds
         || options.maxSeconds > 600 || !options.batchSize || options.batchSize > 128 || !options.maxScanEntries) refuse('invalid_limits');
@@ -299,8 +300,19 @@ export async function maintainCache(input = {}, deps = {}) {
     const needed = Math.max(0, report.cacheBytes - options.budgetBytes, options.targetFreeBytes - report.freeBytesBefore);
     if (!needed) { report.status = 'complete'; report.reason = 'targets_met'; report.freeBytesAfter = report.freeBytesBefore; return report; }
     const selected = []; let selectedBytes = 0;
-    for (const candidate of candidates) {
-      if (selectedBytes >= needed) break;
+    const start = candidates.length ? options.cursor % candidates.length : 0;
+    for (let visited = 0; visited < candidates.length && selected.length < options.maxObjects
+        && selectedBytes < needed && selectedBytes < options.maxBytes; visited++) {
+      checkTime();
+      const index = (start + visited) % candidates.length;
+      const candidate = candidates[index];
+      // Advance even for an oversized/unavailable object. Carrying this number
+      // in the existing receipt lets later rounds reach beyond an all-404 prefix
+      // without adding state writes to a full disk or disclosing object IDs.
+      report.nextCursor = (index + 1) % candidates.length;
+      if (candidate.size > options.maxBytes - selectedBytes) {
+        report.skipped.byte_limit = (report.skipped.byte_limit || 0) + 1; continue;
+      }
       selected.push(candidate); selectedBytes += candidate.size;
     }
     report.candidateObjects = selected.length; report.candidateBytes = selectedBytes;
@@ -351,7 +363,7 @@ export async function maintainCache(input = {}, deps = {}) {
 
 export async function main(argv = process.argv.slice(2)) {
   const names = { '--repo-dir': 'repoDir', '--budget-bytes': 'budgetBytes', '--target-free-bytes': 'targetFreeBytes',
-    '--max-bytes': 'maxBytes', '--max-objects': 'maxObjects', '--max-seconds': 'maxSeconds' };
+    '--max-bytes': 'maxBytes', '--max-objects': 'maxObjects', '--max-seconds': 'maxSeconds', '--cursor': 'cursor' };
   const options = {};
   for (let index = 0; index < argv.length; index++) {
     const flag = argv[index];
